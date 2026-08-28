@@ -217,7 +217,8 @@ class cluster_finder:
             cm_save=self.params_szifi["save_coupling_matrix"],
             cm_name=self.coupling_matrix_name,
             bin_fac=bin_fac,
-            new_shape=new_shape)
+            new_shape=new_shape,
+            cm_backend=self.params_szifi["coupling_matrix_backend"])
 
             #Initiate loop over iterative noise covariance estimation
 

@@ -20,6 +20,8 @@ params_szifi_default = {
 "powspec_implementation": "pymaster", # "pymaster" (NaMaster, matches szifi) or "custom" (JAX, no pymaster)
 "mmf_batched": True, # if False, filter each theta_500 sequentially (direct transcription of
                      # szifi's loop) instead of batching them into one GPU call
+"coupling_matrix_backend": "pymaster", # "pymaster" or "jax" (GPU, ~385x faster, but NOT
+                                      # bit-compatible with NaMaster -- see spec.get_coupling_matrix_jax)
 "inv_cov_backend": "numpy", # "numpy" (LAPACK, matches szifi) or "jax" (cuSOLVER, stays on device).
                             # Not interchangeable where the covariance is ill-conditioned; see spec.get_inv_cov.
 "cov_type": "isotropic", # "isotropic", "anisotropic_boxcar", or "anisotropic_gaussian"

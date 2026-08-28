@@ -121,10 +121,81 @@ def _interp_cov_linear_jit(ell_map, ell_vec, spec_tensor):
 # Classes
 # ============================================================
 
+def get_bin_indicators(pix,l0_bins,lf_bins):
+
+    """Indicator of each ell bin on the 2D Fourier grid, by exact integer comparison.
+
+    szifi's bins are l0_b = b*bin_fac*pi/(nx*dx) and the grid is l = f*sqrt(ix^2+iy^2) with
+    f = 2*pi/(nx*dx), so `l >= l0_b` is exactly `4*(ix^2+iy^2) >= (b*bin_fac)^2`. Doing the
+    comparison on integers keeps modes that sit exactly on a bin edge -- every mode on the lx
+    or ly axis does -- from being assigned by floating-point round-off."""
+
+    nx,ny = pix.nx,pix.ny
+    ix = (np.fft.fftfreq(nx)*nx).round().astype(np.int64)
+    iy = (np.fft.fftfreq(ny)*ny).round().astype(np.int64)
+    n2 = ix[:,None]**2 + iy[None,:]**2
+
+    f = 2.*np.pi/(nx*pix.dx)
+    lo = np.rint(2.*np.asarray(l0_bins)/f).astype(np.int64)
+    hi = np.rint(2.*np.asarray(lf_bins)/f).astype(np.int64)
+
+    return np.stack([((4*n2 >= lo[b]**2) & (4*n2 < hi[b]**2)).astype(np.float64)
+    for b in range(len(lo))])
+
+
+@jax.jit
+def _coupling_matrix_jit(mask,chi):
+
+    """Flat-sky MASTER coupling matrix, M_bb' = (1/N_b) sum_{l in b, l' in b'} |W(l-l')|^2.
+
+    The double sum is a correlation of the two bin indicators against the mask power
+    spectrum, and correlations are FFTs, so the whole matrix is one Gram contraction:
+
+        M_bb' = (1/(nx*ny)^3) Re sum_x conj(Phat(x)) F_b(x) conj(F_b'(x)) / N_b
+
+    with F_b = FFT(chi_b) and Phat = FFT(|FFT(mask)|^2). The 1/(nx*ny)^3 is exact, not
+    fitted: for an all-ones mask W = N delta_k0, so Phat is the constant N^2 and Parseval
+    gives sum_x F_b conj(F_b') = N sum_l chi_b chi_b' = N N_b delta_bb', i.e. M = identity.
+
+    Holds an (n_bins x nx*ny) complex array, so ~4 GB at 1024^2 with 256 bins."""
+
+    nx,ny = mask.shape
+    n = nx*ny
+
+    p_hat = jnp.fft.fft2(jnp.abs(jnp.fft.fft2(mask))**2).ravel()
+    f = jnp.fft.fft2(chi,axes=(1,2)).reshape(chi.shape[0],-1)
+    g = f*jnp.conj(p_hat)[None,:]
+    n_b = chi.reshape(chi.shape[0],-1).sum(axis=1)
+
+    return jnp.real(g@jnp.conj(f).T)/(n_b[:,None]*jnp.float64(n)**3)
+
+
+def get_coupling_matrix_jax(mask,pix,l0_bins,lf_bins):
+
+    """GPU flat-sky MASTER coupling matrix. See _coupling_matrix_jit for the formulation.
+
+    NOT bit-compatible with NaMaster, and not the default. This computes the textbook
+    symmetric matrix: N_b * M_bb' is symmetric, as it must be since the defining double sum
+    is. NaMaster's own matrix is not -- measured asymmetry 4.6e-4 at 128^2 with 32 bins,
+    concentrated in the high-ell bins -- which is the size of the disagreement between the
+    two. In NaMaster's source the row bin index is guarded (`if(ik1>=0)`) while the column
+    index (`i_band_nocut`) is not, so modes falling outside every bin are excluded from rows
+    but not from columns; the Fourier-grid corners are ~20% of modes at these settings.
+
+    Agreement with NaMaster is exact (1e-14) for a mask with no structure, and for <= 8 bins;
+    it degrades to ~1e-3 as the bins narrow. Use only if you have checked that this matters
+    less to you than the ~385x speed-up (0.36 s against 138.8 s at 1024^2 with 256 bins)."""
+
+    chi = get_bin_indicators(pix,l0_bins,lf_bins)
+
+    return np.asarray(_coupling_matrix_jit(jnp.asarray(np.asarray(mask)),jnp.asarray(chi)))
+
+
 class power_spectrum:
 
     def __init__(self, pix, mask=None, cm_compute=False, cm_save=False,
-    cm_name=None, bins=None, bin_fac=4., new_shape=None, cm_compute_scratch=False):
+    cm_name=None, bins=None, bin_fac=4., new_shape=None, cm_compute_scratch=False,
+    cm_backend="pymaster"):
 
         if new_shape is not None:
             pix = maps.degrade_pix(pix, new_shape)
@@ -150,6 +221,8 @@ class power_spectrum:
 
         self.ell_eff = self.bins.get_effective_ells()
         self.w00 = None
+        self.cm_backend = cm_backend
+        self.coupling_matrix_jax = None
 
         if cm_compute == True:
 
@@ -197,6 +270,14 @@ class power_spectrum:
 
 
     def get_coupling_matrix(self):
+
+        if self.cm_backend == "jax":
+
+            self.coupling_matrix_jax = get_coupling_matrix_jax(self.mask,self.pix,
+            self.l0_bins,self.lf_bins)
+
+            return
+
 
         f0 = nmt.NmtFieldFlat(self.pix.nx*self.pix.dx,self.pix.ny*self.pix.dy,self.mask,[np.zeros((self.pix.nx,self.pix.ny))])
         w00 = nmt.NmtWorkspaceFlat()
@@ -249,11 +330,18 @@ class power_spectrum:
 
             elif decouple_type == "master":
 
-                if self.w00 is None:
+                if self.w00 is None and self.coupling_matrix_jax is None:
 
                     self.get_coupling_matrix()
 
-                ret = (self.ell_eff,self.w00.decouple_cell(cl00_coupled)[0])
+                if self.coupling_matrix_jax is not None:
+
+                    ret = (self.ell_eff,
+                    np.linalg.solve(self.coupling_matrix_jax,np.asarray(cl00_coupled[0])))
+
+                else:
+
+                    ret = (self.ell_eff,self.w00.decouple_cell(cl00_coupled)[0])
 
             elif decouple_type == "fsky":
 

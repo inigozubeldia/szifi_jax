@@ -72,11 +72,54 @@ Three optimisations came out of this, all exact and all applied to szifi as well
   tabulating a profile than 1000 separate `scipy.integrate.quad` calls and takes szifi from
   43.9 s to 31.6 s in the no-coupling-matrix configuration.
 
-If the coupling matrix does have to be computed, it is ~139 s per tile and dwarfs everything
-else. Reuse it. The remaining lever, if that is still too slow, is the all-JAX power-spectrum
-estimator (`powspec_implementation="custom"`, §5), which avoids NaMaster entirely — but it
-does not implement MASTER decoupling, so it is a different estimator and is **not yet
-validated**. Do not switch it on without checking it against the pymaster path first.
+### The mode-coupling matrix on the GPU
+
+`coupling_matrix_backend="jax"` computes the flat-sky MASTER matrix on the GPU instead of
+calling NaMaster, removing the last large cost. Measured on Planck field 0:
+
+| configuration | wall | `q_opt` vs szifi |
+|---|---|---|
+| szifi, matrix loaded from disk | 31.4 s | — |
+| szifi, matrix computed by NaMaster | 167.3 s | — |
+| szifi_jax, matrix loaded from disk | 5.5 s | 3.8e-8 |
+| **szifi_jax, matrix computed on the GPU every run** | **3.9 s** | **2.4e-7** |
+
+The matrix itself goes from 138.0 s to 1.04 s (133x). End to end that is **43x** against a
+cold szifi run — and it is *faster than loading a precomputed matrix from disk*, so the whole
+save/reuse workflow becomes unnecessary.
+
+**It is not bit-compatible with NaMaster, and it is off by default.** The defining double sum
+
+    S_bb' = sum_{l in b} sum_{l' in b'} |W(l - l')|^2,   M_bb' = S_bb' / N_b
+
+is manifestly symmetric in (b, b'). Ours is symmetric to 5.6e-17. NaMaster's is asymmetric by
+**4.6e-4**, concentrated in the high-ell bins, and that asymmetry is the entire disagreement
+between the two — they track each other as the bins narrow:
+
+| bins (128²) | ours vs NaMaster | NaMaster's asymmetry |
+|---|---|---|
+| 8   | 1.5e-13 | 1.9e-15 |
+| 16  | 2.6e-4  | 2.9e-4  |
+| 32  | 1.1e-3  | 4.6e-4  |
+| 64  | 4.0e-3  | 5.6e-4  |
+
+Where the asymmetry vanishes the two agree to **1e-13**. In NaMaster's source the row bin
+index is guarded (`if(ik1>=0)`) while the column index (`i_band_nocut`) is not, so Fourier
+modes falling outside every bin — the grid corners beyond the last bin edge, ~20% of modes at
+these settings — are excluded from rows but not from columns. That is consistent with
+everything measured, but it has not been confirmed with NaMaster's authors, so treat the
+attribution as a hypothesis and the numbers as the fact.
+
+The normalisation is exact, not fitted: `1/(nx·ny)³`, verified by the matrix coming out as the
+identity (6.7e-16) for a structureless mask.
+
+In practice the 1e-3 difference in the matrix washes out to **2.4e-7** in `q_opt`, because it
+lives in the weakly weighted high-ell off-diagonals. If that is acceptable for your analysis,
+turn it on; `tests/test_coupling_matrix.py` reports all of the above so you can re-measure.
+
+The other lever remains `powspec_implementation="custom"`, the all-JAX estimator in `spec.py`,
+which skips NaMaster entirely but does **not** implement MASTER decoupling — a different
+estimator, not a drop-in, and still unvalidated.
 
 ## 2. Coverage
 
@@ -207,6 +250,7 @@ misspelled `snr_weigthing` key, so a params dict written against either package 
 | `powspec_implementation` | `"pymaster"` (what szifi always uses) | `"custom"`, an all-JAX estimator, **not yet validated** |
 | `inv_cov_backend` | `"numpy"` (LAPACK, as szifi) | `"jax"` (cuSOLVER, stays on device) |
 | `mmf_batched` | `True` | `False`, filter each `theta_500` sequentially |
+| `coupling_matrix_backend` | `"pymaster"` (bit-compatible with szifi) | `"jax"`, 133x faster, differs by ~1e-3 in the matrix and 2.4e-7 in `q_opt` |
 | `params_model["los_integral"]` | `"gauss_legendre"` (now also szifi's default) | `"quad"`, szifi's pre-fix call (§3.1) |
 
 `inpaint_type` gains `"diffusive_jax"` alongside szifi's `"diffusive"` and `"orphics"`.
@@ -313,16 +357,10 @@ Not yet exercised by any test:
 1. Extend `tests/test_comparison.py` to CAR tiles and a multi-field run.
 2. Exercise the spectrally-constrained MMF and `max_it > 1`; give `utils.invert_cov` the same
    backend switch as `spec.get_inv_cov`.
-3. Decide what to do about the mode-coupling matrix, the one remaining large cost (~139 s per
-   tile, 97% of a cold run). Two options, neither finished:
-   * `powspec_implementation="custom"`, the all-JAX estimator already in `spec.py`. Avoids
-     NaMaster entirely but does **not** implement MASTER decoupling, so it is a different
-     estimator, not a drop-in. Unvalidated.
-   * `notes/mode_coupling_fft_prototype.py`, a GPU implementation of the *same* MASTER
-     matrix via FFTs. The formula is verified exact against pymaster (3.4e-15 by brute force
-     on a small grid) and runs in **0.36 s against pymaster's 138.8 s** at full size, but
-     currently agrees only to ~6e-7, with one bin at 1.5e-4. Three candidate causes have been
-     tested and rejected; see the module docstring. Needs ~1e-12 before it can be used.
+3. Decide whether `coupling_matrix_backend="jax"` should become the default. It is 43x faster
+   end to end and costs 2.4e-7 in `q_opt`, but it is not bit-compatible with NaMaster, and the
+   reason is a suspected asymmetry in NaMaster itself that would be worth raising upstream
+   before relying on it. Validating `powspec_implementation="custom"` is the other open lever.
 4. Port `reshape_ell_matrix` and `resample_fft` to JAX and lift the `inv_cov` shape
    restriction on the batched MMF.
 5. Move noise generation to `jax.random` so simulations are reproducible and jittable.
