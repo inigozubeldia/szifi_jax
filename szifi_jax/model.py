@@ -6,12 +6,28 @@ import scipy.optimize as optimize
 from szifi_jax import maps
 import astropy.cosmology as cp
 
-# Gauss-Legendre quadrature for LOS integration with cubic substitution.
-# The gNFW pressure profile has a cusp P(x)~x^{-gamma} (gamma~0.3) near x=0.
-# A cubic substitution z = R*t^3 regularizes the integrand: the Jacobian 3R*t^2
-# cancels the cusp, making the integrand ~ |t|^{2-3*gamma} ~ |t|^{1.08} (smooth).
-# This gives <1e-6 relative accuracy with 256 GL nodes across all radii.
-_GL_N = 256
+# Gauss-Legendre quadrature for the line-of-sight integral, with a cubic substitution.
+#
+# The integrand is P(sqrt(z^2 + r^2)) truncated at x = R_truncation, so as a function of z it
+# is nonzero only on |z| < Z(r) = sqrt(R_truncation^2 - r^2) and jumps to zero there. Both the
+# truncation edge and the central cusp P(x) ~ x^-gamma have to be handled:
+#
+#   * integrating over [-Z(r), Z(r)] rather than [-R_truncation, R_truncation] removes the
+#     discontinuity from the quadrature interval entirely — GL cannot resolve a jump, and
+#     integrating over the full range costs several percent for r close to R_truncation.
+#   * the substitution z = Z(r) t^_GL_POWER clusters nodes near z = 0 and contributes a
+#     Jacobian p Z t^(p-1) that cancels the cusp, leaving an integrand ~ |t|^(p-1-p gamma).
+#
+# p must be odd so that z = Z t^p stays an odd bijection of [-1, 1]. p = 3 leaves the
+# integrand as |t|^1.08 at r -> 0, whose derivative is still singular; Gauss-Legendre then
+# converges only as N^-2 there and is ~1e-4 accurate at 256 nodes, which is worse than the
+# scipy.integrate.quad call it replaces. p = 7 leaves |t|^4.2 and reaches ~1e-12 at 512
+# nodes across the whole radial range, at no extra cost.
+#
+# Accuracy against scipy.integrate.quad and against a 40-digit mpmath reference is measured
+# in tests/test_parity_units.py.
+_GL_N = 512
+_GL_POWER = 7
 _GL_NODES_NP, _GL_WEIGHTS_NP = np.polynomial.legendre.leggauss(_GL_N)
 _GL_NODES_JAX = jnp.array(_GL_NODES_NP, dtype=jnp.float64)
 _GL_WEIGHTS_JAX = jnp.array(_GL_WEIGHTS_NP, dtype=jnp.float64)
@@ -31,23 +47,26 @@ def _pressure_profile_battaglia_jit(x, P0, xc, gamma, alpha, beta, R_truncation)
     p_cal = P0 * (x / xc)**gamma * (1. + (x / xc)**alpha)**(-beta)
     return jnp.where(x < R_truncation, p_cal, 0.)
 
+def _los_nodes(r, R_truncation):
+    """Quadrature nodes and Jacobian for z = Z(r) t^_GL_POWER on the integrand's support."""
+    z_half = jnp.sqrt(jnp.maximum(R_truncation**2 - r**2, 0.))
+    t = _GL_NODES_JAX
+    z_los = z_half * t**_GL_POWER
+    jacobian = _GL_POWER * z_half * t**(_GL_POWER - 1)
+    return z_los, jacobian
+
 @jax.jit
 def _get_p_cal_int_arnaud_jit(r, R_truncation, P0, c_500, gamma, alpha, beta):
-    """LOS integral via GL quadrature with cubic substitution for Arnaud profile.
-    Substitution: z = R_truncation * t^3, dz = 3*R_truncation*t^2 dt."""
-    t = _GL_NODES_JAX
-    z_los = R_truncation * t**3
-    jacobian = 3. * R_truncation * t**2
+    """LOS integral via GL quadrature with cubic substitution for the Arnaud profile."""
+    z_los, jacobian = _los_nodes(r, R_truncation)
     x = jnp.sqrt(z_los**2 + r**2)
     p = _pressure_profile_arnaud_jit(x, P0, c_500, gamma, alpha, beta, R_truncation)
     return jnp.dot(_GL_WEIGHTS_JAX, p * jacobian)
 
 @jax.jit
 def _get_p_cal_int_battaglia_jit(r, R_truncation, P0, xc, gamma, alpha, beta):
-    """LOS integral via GL quadrature with cubic substitution for Battaglia profile."""
-    t = _GL_NODES_JAX
-    z_los = R_truncation * t**3
-    jacobian = 3. * R_truncation * t**2
+    """LOS integral via GL quadrature with cubic substitution for the Battaglia profile."""
+    z_los, jacobian = _los_nodes(r, R_truncation)
     x = jnp.sqrt(z_los**2 + r**2)
     p = _pressure_profile_battaglia_jit(x, P0, xc, gamma, alpha, beta, R_truncation)
     return jnp.dot(_GL_WEIGHTS_JAX, p * jacobian)
@@ -59,7 +78,8 @@ _vmap_p_cal_int_battaglia = jax.jit(jax.vmap(_get_p_cal_int_battaglia_jit, in_ax
 
 class gnfw:
 
-    def __init__(self,M,z_halo,cosmology,c=1.177,Delta=500.,type="arnaud",R_truncation=5.):
+    def __init__(self,M,z_halo,cosmology,c=1.177,Delta=500.,type="arnaud",R_truncation=5.,
+    los_integral="gauss_legendre"):
 
         #Create variables
 
@@ -70,6 +90,7 @@ class gnfw:
         self.Delta = Delta
         self.type = type
         self.R_truncation = R_truncation
+        self.los_integral = los_integral
 
         #Calculate basic quantities
 
@@ -99,19 +120,8 @@ class gnfw:
         theta_max = self.theta_Delta*self.my_params_sz.R_truncation
         theta_vec = jnp.linspace(0.,theta_max,1000)
 
-        # Vectorized LOS integral
-        r_vec = theta_vec / self.theta_Delta
-
-        if self.type == "arnaud":
-            p_cal_vec = _vmap_p_cal_int_arnaud(r_vec,
-                self.my_params_sz.R_truncation,
-                self.my_params_sz.P0, self.my_params_sz.c_500,
-                self.my_params_sz.gamma, self.my_params_sz.alpha, self.my_params_sz.beta)
-        elif self.type == "battaglia":
-            p_cal_vec = _vmap_p_cal_int_battaglia(r_vec,
-                self.my_params_sz.R_truncation,
-                self.my_params_sz.P0, self.my_params_sz.xc,
-                self.my_params_sz.gamma, self.my_params_sz.alpha, self.my_params_sz.beta)
+        # Vectorised LOS integral
+        p_cal_vec = self.get_p_cal_int_vec(theta_vec / self.theta_Delta)
 
         if tile_type == "healpix":
 
@@ -196,18 +206,7 @@ class gnfw:
 
         theta_max = self.theta_Delta*x
         theta_vec = jnp.linspace(0.,theta_max,1000)
-        r_vec = theta_vec / self.theta_Delta
-
-        if self.type == "arnaud":
-            p_cal_vec = _vmap_p_cal_int_arnaud(r_vec,
-                self.my_params_sz.R_truncation,
-                self.my_params_sz.P0, self.my_params_sz.c_500,
-                self.my_params_sz.gamma, self.my_params_sz.alpha, self.my_params_sz.beta)
-        elif self.type == "battaglia":
-            p_cal_vec = _vmap_p_cal_int_battaglia(r_vec,
-                self.my_params_sz.R_truncation,
-                self.my_params_sz.P0, self.my_params_sz.xc,
-                self.my_params_sz.gamma, self.my_params_sz.alpha, self.my_params_sz.beta)
+        p_cal_vec = self.get_p_cal_int_vec(theta_vec / self.theta_Delta)
 
         y_vec = self.p_cal_to_y(p_cal_vec)
 
@@ -215,7 +214,8 @@ class gnfw:
         self.theta_vec = theta_vec
 
         y_vec = y_vec.at[0].set(0.)
-        Y_aperture = jnp.trapezoid(y_vec*2.*jnp.pi*theta_vec,theta_vec)
+        #Simpson, as in szifi
+        Y_aperture = integrate.simpson(np.asarray(y_vec*2.*jnp.pi*theta_vec),x=np.asarray(theta_vec))
 
         return Y_aperture
 
@@ -235,8 +235,50 @@ class gnfw:
 
         return p_cal
 
+    def get_p_cal_int_vec(self,r):
+        """LOS integral for an array of radii, in a single batched GPU call.
+
+        With los_integral="quad" this falls back to szifi's scipy.integrate.quad call, one
+        radius at a time, for bit-level reproduction of szifi at the cost of accuracy and
+        speed."""
+
+        if self.los_integral == "quad":
+
+            return jnp.asarray([self._get_p_cal_int_quad(float(x)) for x in np.asarray(r)])
+
+        r = jnp.asarray(r,dtype=jnp.float64)
+
+        if self.type == "arnaud":
+
+            return _vmap_p_cal_int_arnaud(r,
+                self.my_params_sz.R_truncation,
+                self.my_params_sz.P0, self.my_params_sz.c_500,
+                self.my_params_sz.gamma, self.my_params_sz.alpha, self.my_params_sz.beta)
+
+        elif self.type == "battaglia":
+
+            return _vmap_p_cal_int_battaglia(r,
+                self.my_params_sz.R_truncation,
+                self.my_params_sz.P0, self.my_params_sz.xc,
+                self.my_params_sz.gamma, self.my_params_sz.alpha, self.my_params_sz.beta)
+
+    def _get_p_cal_int_quad(self,r):
+        """szifi's line-of-sight integral, verbatim: adaptive quadrature over the full
+        [-R_truncation, R_truncation] range, without telling quad where the integrand's
+        truncation edge or central cusp are."""
+
+        def p_cal(z_los):
+
+            return self.pressure_profile(np.sqrt(z_los**2+r**2))
+
+        return integrate.quad(p_cal,-self.my_params_sz.R_truncation,self.my_params_sz.R_truncation,
+        epsabs=1.49e-08/100.,limit=100)[0]
+
     def get_p_cal_int(self,r):
-        """LOS integral using Gauss-Legendre quadrature."""
+        """LOS integral using Gauss-Legendre quadrature. Scalar entry point; prefer
+        get_p_cal_int_vec for arrays, which avoids one dispatch and host sync per element."""
+        if self.los_integral == "quad":
+            return self._get_p_cal_int_quad(r)
         if self.type == "arnaud":
             return float(_get_p_cal_int_arnaud_jit(
                 jnp.float64(r), self.my_params_sz.R_truncation,
@@ -279,7 +321,7 @@ class gnfw:
     def get_y_map_hankel(self,pix,theta_misc=[0.,0.]):
 
         def to_transform(theta):
-            return np.vectorize(self.get_p_cal_int)(theta/self.theta_Delta)
+            return np.asarray(self.get_p_cal_int_vec(theta/self.theta_Delta))
 
         theta_range = [pix.dx/20.,self.theta_Delta*self.my_params_sz.R_truncation*10.]
 
@@ -336,7 +378,7 @@ class gnfw:
 
         def to_transform(theta):
 
-            return np.vectorize(self.get_p_cal_int)(theta/self.theta_Delta)
+            return np.asarray(self.get_p_cal_int_vec(theta/self.theta_Delta))
 
         theta_range = [pix.dx/10.,self.theta_Delta*self.my_params_sz.R_truncation*20.]
 

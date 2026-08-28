@@ -13,19 +13,6 @@ import scipy.ndimage as ndimage
 # JIT-compiled functions for custom power spectrum estimation
 # ============================================================
 
-@functools.partial(jax.jit, static_argnums=(3,4))
-def _get_cross_spec_custom_jit(tmap_fft, mask_fft, n_freq, nx, ny):
-    """Compute all cross-spectra at once via outer product of FFTs.
-
-    tmap_fft: (nx, ny, n_freq) complex array of masked map FFTs
-    mask_fft: (nx, ny) complex array of mask FFT (for fsky correction)
-    Returns: (nx, ny, n_freq, n_freq) real cross-power spectrum maps
-    """
-    # Cross-spectrum: conj(fft_i) * fft_j for all (i,j) pairs
-    # Result shape: (nx, ny, n_freq, n_freq)
-    cross = jnp.real(jnp.conj(tmap_fft[:,:,:,None]) * tmap_fft[:,:,None,:])
-    return cross
-
 
 @functools.partial(jax.jit, static_argnums=(4,))
 def _bin_cross_spec_jit(cross_spec_maps, ell_map, bins_low, bins_high, n_bins):
@@ -74,7 +61,11 @@ def _bin_cross_spec_jit(cross_spec_maps, ell_map, bins_low, bins_high, n_bins):
 
 @jax.jit
 def _interp_cov_jit(ell_map, ell_vec, spec_tensor):
-    """Interpolate 1D binned spectra onto 2D ell map. Nearest-neighbor.
+    """Interpolate 1D binned spectra onto 2D ell map, nearest-neighbour.
+
+    Reproduces scipy.interpolate.interp1d(kind="nearest"): ties go to the lower bin
+    (scipy searchsorts the bin midpoints with side="left"), and out-of-range values
+    clamp to the end bins.
 
     ell_map: (nx, ny) 2D ell values
     ell_vec: (n_ell,) 1D ell bin centres
@@ -84,19 +75,19 @@ def _interp_cov_jit(ell_map, ell_vec, spec_tensor):
     n_ell, n_freq, _ = spec_tensor.shape
     ell_flat = ell_map.ravel()
 
-    # For nearest-neighbor: find closest bin for each pixel
-    # |ell_flat[i] - ell_vec[j]| minimized over j
-    # Use searchsorted for efficiency
-    idx = jnp.searchsorted(ell_vec, ell_flat)
-    idx = jnp.clip(idx, 1, n_ell - 1)
-
-    # Compare distances to left and right neighbors
-    left = ell_vec[idx - 1]
-    right = ell_vec[idx]
-    nearest_idx = jnp.where(jnp.abs(ell_flat - left) <= jnp.abs(ell_flat - right), idx - 1, idx)
-
-    # Extrapolate: clamp to valid range
-    nearest_idx = jnp.clip(nearest_idx, 0, n_ell - 1)
+    # scipy's interp1d(kind="nearest") builds the bin boundaries once, as the midpoints
+    # between consecutive centres, and searchsorts against them with side="left":
+    #
+    #     x_bds = (x[1:] + x[:-1]) / 2
+    #     idx = searchsorted(x_bds, x_new, side="left").clip(0, len(x) - 1)
+    #
+    # Do the same rather than comparing |v - left| against |v - right|. The two agree only
+    # when the midpoint is exactly representable; where it is not, a value sitting on a
+    # boundary snaps to a different bin under the two rules. That is not a corner case here:
+    # the bin centres sit at odd multiples of the fundamental mode and the boundaries at even
+    # multiples, so every mode on the lx or ly axis lands exactly on one.
+    ell_bds = 0.5 * (ell_vec[1:] + ell_vec[:-1])
+    nearest_idx = jnp.clip(jnp.searchsorted(ell_bds, ell_flat, side="left"), 0, n_ell - 1)
 
     # Gather: (n_pix, n_freq, n_freq)
     result = spec_tensor[nearest_idx]
@@ -105,10 +96,25 @@ def _interp_cov_jit(ell_map, ell_vec, spec_tensor):
 
 
 @jax.jit
-def _correct_for_inpainting_jit(ell, cl, fsky, lsep):
-    """Apply inpainting correction to power spectrum."""
-    cl_corrected = jnp.where(ell > lsep, cl / fsky, cl)
-    return cl_corrected
+def _interp_cov_linear_jit(ell_map, ell_vec, spec_tensor):
+    """Linear interpolation of 1D binned spectra onto a 2D ell map, with linear
+    extrapolation beyond the end bins (scipy's fill_value="extrapolate" behaviour;
+    jnp.interp clamps instead, so the slope has to be applied by hand)."""
+    n_ell = spec_tensor.shape[0]
+    ell_flat = ell_map.ravel()
+
+    idx = jnp.clip(jnp.searchsorted(ell_vec, ell_flat) - 1, 0, n_ell - 2)
+
+    x0 = ell_vec[idx]
+    x1 = ell_vec[idx + 1]
+    y0 = spec_tensor[idx]
+    y1 = spec_tensor[idx + 1]
+
+    t = (ell_flat - x0) / (x1 - x0)
+    result = y0 + (y1 - y0) * t[:, None, None]
+
+    return result.reshape(ell_map.shape[0], ell_map.shape[1], *spec_tensor.shape[1:])
+
 
 
 # ============================================================
@@ -465,17 +471,43 @@ class cross_spec:
         return cov_tensor # nx x ny x n_freq x n_freq covariance tensor
 
     def get_inv_cov(self,pix,t_map=None,mask=None,bin_fac=4,new_shape=None,ps=None,
-                    decouple_type="master",interp_type="nearest",cov_type="isotropic",cov_kernel_shape=None):
+                    decouple_type="master",interp_type="nearest",cov_type="isotropic",
+                    cov_kernel_shape=None,inv_cov_backend="numpy"):
 
-        # Fast fused path for anisotropic_gaussian: cov + inv in one call
+        """Inverse of the per-mode noise covariance.
+
+        `inv_cov_backend` selects the linear-algebra backend:
+
+          "numpy" (default) — np.linalg.inv, i.e. exactly what szifi calls.
+          "jax"             — jnp.linalg.inv, keeping the tensor on the device.
+
+        These are not interchangeable. The noise covariance is numerically singular at some
+        modes (|inv_cov| reaches ~3e14 on Planck field 0), and LAPACK and cuSOLVER diverge
+        there: measured agreement is ~2e-15 for condition numbers below 1e4 but degrades to
+        ~1e-3 beyond 1e12, which propagates to ~1e-4 in the filter normalisations and ~3e-3
+        in the recovered SNR. The CPU inversion of a 1024x1024 grid of 6x6 matrices takes
+        ~0.4 s against a ~300 s cluster-finding run, so exactness is the better default."""
+
         if cov_type == "anisotropic_gaussian":
-            return _get_cov_and_inv_anisotropic_gaussian_fast(t_map, pix, mask, cov_kernel_shape)
 
-        cov = self.get_cov(pix,t_map=t_map,mask=mask,bin_fac=bin_fac,new_shape=new_shape,
-        ps=ps,decouple_type=decouple_type,interp_type=interp_type,
-        cov_type=cov_type,cov_kernel_shape=cov_kernel_shape)
+            cov = _get_cov_anisotropic_gaussian_fast(t_map, pix, mask, cov_kernel_shape)
 
-        return jnp.linalg.inv(cov)
+        else:
+
+            cov = self.get_cov(pix,t_map=t_map,mask=mask,bin_fac=bin_fac,new_shape=new_shape,
+            ps=ps,decouple_type=decouple_type,interp_type=interp_type,
+            cov_type=cov_type,cov_kernel_shape=cov_kernel_shape)
+
+        if inv_cov_backend == "numpy":
+
+            return jnp.asarray(np.linalg.inv(np.asarray(cov)))
+
+        elif inv_cov_backend == "jax":
+
+            return jnp.linalg.inv(jnp.asarray(cov))
+
+        raise ValueError(f"inv_cov_backend \"{inv_cov_backend}\" not supported. "
+        "Allowed values are 'numpy' and 'jax'.")
 
 def get_cov_anisotropic(t_map,pix,mask=None,cov_type=None,cov_kernel_shape=None,cov_tensor_isotropic=None):
 
@@ -528,22 +560,6 @@ def _make_gaussian_kernel_2d(sigma_x, sigma_y, truncate=4.0):
     ky /= ky.sum()
     return jnp.array(np.outer(kx, ky))
 
-
-@functools.partial(jax.jit, static_argnums=(2, 3))
-def _gaussian_smooth_reflect_batch_jit(arr_batch, kernel, pad_x, pad_y):
-    """Gaussian smooth a batch of 2D arrays with reflect (symmetric) padding.
-
-    arr_batch: (n_pairs, nx, ny) — batch of 2D arrays
-    kernel: (kx, ky) — discrete 2D Gaussian kernel
-    pad_x, pad_y: int — padding size (= kernel half-width)
-
-    Returns: (n_pairs, nx, ny) — smoothed arrays
-    """
-    def smooth_one(arr):
-        padded = jnp.pad(arr, ((pad_x, pad_x), (pad_y, pad_y)), mode='symmetric')
-        conv = jax.scipy.signal.fftconvolve(padded, kernel, mode='same')
-        return conv[pad_x:-pad_x, pad_y:-pad_y]
-    return jax.vmap(smooth_one)(arr_batch)
 
 
 def _get_cov_anisotropic_gaussian_fast(t_map, pix, mask, cov_kernel_shape):
@@ -661,11 +677,43 @@ def get_anisotropic_ps(map1,map2,pix,type="boxcar",mask=None,cov_kernel_shape=No
 
 def interp_cov(ell_interp,ell,cov_tensor,interp_type="nearest"):
 
+    """Interpolate binned cross-spectra onto the 2D ell map.
+
+    Mirrors szifi's scipy.interpolate.interp1d(kind=interp_type, bounds_error=False,
+    fill_value="extrapolate"). "nearest" and "linear" have JAX implementations that reproduce
+    scipy's tie-breaking and extrapolation; any other kind falls back to scipy so that the
+    requested interpolation is never silently replaced by a different one."""
+
     ell_jnp = jnp.asarray(ell)
     cov_jnp = jnp.asarray(cov_tensor)
     ell_interp_jnp = jnp.asarray(ell_interp)
 
-    return _interp_cov_jit(ell_interp_jnp, ell_jnp, cov_jnp)
+    if interp_type == "nearest":
+
+        return _interp_cov_jit(ell_interp_jnp, ell_jnp, cov_jnp)
+
+    elif interp_type == "linear":
+
+        return _interp_cov_linear_jit(ell_interp_jnp, ell_jnp, cov_jnp)
+
+    else:
+
+        ell_np = np.asarray(ell)
+        cov_np = np.asarray(cov_tensor)
+        ell_interp_np = np.asarray(ell_interp)
+
+        (d1,d2,d3) = cov_np.shape
+        (nx,ny) = ell_interp_np.shape
+        interp_tensor = np.zeros((nx,ny,d2,d3))
+
+        for i in range(0,d2):
+
+            for j in range(0,d3):
+
+                interp_tensor[:,:,i,j] = interpolate.interp1d(ell_np,cov_np[:,i,j],
+                kind=interp_type,bounds_error=False,fill_value="extrapolate")(ell_interp_np)
+
+        return jnp.asarray(interp_tensor)
 
 
 def get_camb_cltt(exp=None,freq=0,freq2=None,beams="gaussian"):

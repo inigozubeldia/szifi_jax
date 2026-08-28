@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+from numba import njit as numba_njit
 from scipy import interpolate
 import scipy.signal as sp
 import pymaster as nmt
@@ -38,8 +39,21 @@ class pixel:
 
         return cosmology.angular_diameter_distance(z).value*self.dy  #in Mpc
 
-# Module-level cache for ell maps (keyed by pixel dimensions)
+# Module-level cache for ell maps, keyed by pixel dimensions. Bounded so that a run over
+# many distinct tile geometries cannot accumulate device arrays without limit.
 _ell_cache = {}
+_ELL_CACHE_MAX = 8
+
+
+def _ell_cache_store(key, ell):
+
+    if len(_ell_cache) >= _ELL_CACHE_MAX:
+
+        _ell_cache.pop(next(iter(_ell_cache)))
+
+    _ell_cache[key] = ell
+
+    return ell
 
 class rmap:
 
@@ -103,20 +117,32 @@ class rmap:
 
     def get_lxly(self):
 
-        lx,ly = jnp.meshgrid(jnp.fft.fftfreq(self.nx,self.dx)*2.*jnp.pi,jnp.fft.fftfreq(self.ny,self.dy)*2.*jnp.pi)
+        #Built in NumPy, then moved to the device. See get_ell for why this must not be a
+        #device computation.
+        lx,ly = np.meshgrid(np.fft.fftfreq(self.nx,self.dx)*2.*np.pi,np.fft.fftfreq(self.ny,self.dy)*2.*np.pi)
         lx = lx.transpose()
         ly = ly.transpose()
 
-        return lx,ly
+        return jnp.asarray(lx),jnp.asarray(ly)
 
     def get_ell(self):
+        """|ell| for every Fourier mode, computed in NumPy and then moved to the device.
+
+        This must not be a device computation. The power-spectrum bin centres sit at odd
+        multiples of the fundamental mode and their midpoints at even multiples, so a large
+        set of ell values -- every mode on the lx or ly axis, among others -- falls exactly
+        on a bin midpoint. interp_cov snaps each mode to its nearest bin, so at those modes
+        the assignment is a tie, and a ~1e-12 difference between the CPU and GPU evaluations
+        of sqrt(lx^2 + ly^2) breaks the tie the other way. That shifts the covariance at
+        those modes by a whole bin (~2e4 out of ~1e6 here), which propagates to ~1e-4 in the
+        filter normalisations and ~3e-3 in the recovered SNR. Building ell on the host makes
+        it bit-identical to szifi's, so the ties break the same way."""
         key = (self.nx, self.ny, self.dx, self.dy)
         if key in _ell_cache:
             return _ell_cache[key]
         lx, ly = self.get_lxly()
-        ell = jnp.sqrt(lx**2 + ly**2)
-        _ell_cache[key] = ell
-        return ell
+        ell = jnp.asarray(np.sqrt(np.asarray(lx)**2 + np.asarray(ly)**2))
+        return _ell_cache_store(key, ell)
 
     def convolve_gaussian(self,fwhm_arcmin):
 
@@ -177,16 +203,19 @@ class tmap:
 
     def get_lxly(self):
 
-        return jnp.meshgrid(jnp.fft.fftfreq(self.ny,self.dy)*2.*jnp.pi,jnp.fft.fftfreq(self.nx,self.dx)*2.*jnp.pi)
+        lx,ly = np.meshgrid(np.fft.fftfreq(self.ny,self.dy)*2.*np.pi,np.fft.fftfreq(self.nx,self.dx)*2.*np.pi)
+
+        return jnp.asarray(lx),jnp.asarray(ly)
 
     def get_ell(self):
+        """See rmap.get_ell: built on the host so that modes sitting exactly on a bin
+        midpoint snap to the same bin as in szifi."""
         key = (self.nx, self.ny, self.dx, self.dy)
         if key in _ell_cache:
             return _ell_cache[key]
         lx, ly = self.get_lxly()
-        ell = jnp.sqrt(lx**2 + ly**2)
-        _ell_cache[key] = ell
-        return ell
+        ell = jnp.asarray(np.sqrt(np.asarray(lx)**2 + np.asarray(ly)**2))
+        return _ell_cache_store(key, ell)
 
     def convolve_gaussian(self,fwhm_arcmin_vec):
 
@@ -840,7 +869,7 @@ def mask_sigma(map_val,sigma,inpaint_flag=False,n_inpaint=100):
 
         mask = np.ones(map_np.shape)
         mask[indices] = 0.
-        map_np = np.asarray(diffusive_inpaint_jax(jnp.array(map_np),jnp.array(mask),n_inpaint))
+        map_np = np.asarray(diffusive_inpaint(map_np,mask,n_inpaint))
 
     return jnp.array(map_np)
 
@@ -1111,8 +1140,9 @@ def get_map_convolved_fft(map_fft_original,pix,freqs,beam_type,mask,lrange,exp):
 
 def inpaint_freq(tmap_val,mask,n_inpaint=None, pix=None, noise=None,inpaint_type="diffusive"):
 
-    if inpaint_type == "diffusive":
-        # Vectorized: vmap diffusive inpainting over all frequencies at once
+    if inpaint_type == "diffusive_jax":
+        # Vectorised: vmap the Jacobi inpainting over all frequencies at once, on the GPU.
+        # Faster than the exact Gauss-Seidel sweep, but not equal to it at finite n_inpaint.
         tmap_jnp = jnp.asarray(tmap_val)
         mask_jnp = jnp.asarray(mask)
         ret = _inpaint_freq_vmap(tmap_jnp, mask_jnp, n_inpaint)
@@ -1137,6 +1167,10 @@ def _inpaint_freq_vmap(tmap_3d, mask, n_inpaint):
 def inpaint(image, mask, n_inpaint=None, pix=None, noise=None, inpaint_type="diffusive"):
 
     if inpaint_type == "diffusive":
+
+        inpainted_image = diffusive_inpaint(image, mask, n_inpaint)
+
+    elif inpaint_type == "diffusive_jax":
 
         inpainted_image = diffusive_inpaint_jax(jnp.asarray(image), jnp.asarray(mask), n_inpaint)
 
@@ -1165,7 +1199,16 @@ def circular_cosine_blend_adaptive(
 ):
     """
     Adaptive region blending with cosine taper.
-    Vectorized: one global EDT + per-region radius lookup, no per-region loop.
+    Vectorised: one global EDT + per-region radius lookup, no per-region loop.
+
+    szifi computes, for each labelled hole, the EDT of that hole alone inside a padded
+    bounding box, i.e. the distance to the nearest pixel not in that hole. The single global
+    EDT used here is equal to it: hole regions are 8-connected components, so any raster path
+    from a pixel of one hole to a pixel of another must cross a non-hole pixel, which is
+    therefore at least as close as the other hole. Hence distance-to-nearest-non-hole equals
+    distance-to-nearest-pixel-not-in-this-hole, pixel by pixel.
+
+    `pad` is accepted for signature compatibility and is not needed by the global transform.
     """
     assert 0 <= inner_zero_frac < 1, "inner_zero_frac must be in [0, 1)"
 
@@ -1192,6 +1235,11 @@ def circular_cosine_blend_adaptive(
     region_radii = np.sqrt(region_areas / np.pi)
     # region_radii[0] is background (mask=1), ignore
 
+    # szifi skips regions smaller than min_radius, leaving them purely inpainted with no
+    # cosine taper. Zeroing their radius reproduces that: the annulus condition
+    # 0 < dist <= radius is then never satisfied, so w stays 0 across the region.
+    region_radii = np.where(region_radii < min_radius, 0., region_radii)
+
     # Map each pixel to its region's radius
     radius_map = region_radii[labeled_mask]
 
@@ -1215,11 +1263,19 @@ def circular_cosine_blend_adaptive(
 
 @jax.jit
 def _edt_jfa_jax(hole_mask):
-    """Euclidean distance transform using Jump Flooding Algorithm on GPU.
+    """Euclidean distance transform by jump flooding, on the GPU.
 
-    hole_mask: (ny, nx) bool JAX array — True where holes are.
-    Returns: (ny, nx) float32 array — distance from each hole pixel to nearest non-hole.
-    Exact match with scipy.ndimage.distance_transform_edt.
+    hole_mask: (ny, nx) bool array, True inside holes.
+    Returns: (ny, nx) distance from each hole pixel to the nearest non-hole pixel.
+
+    NOT exact. Jump flooding is an approximate algorithm: it propagates a single candidate
+    seed per pixel, so a pixel whose true nearest seed never reaches it through the halving
+    step sequence keeps a farther one. On scattered discs of radius <= 8 px it agrees with
+    scipy.ndimage.distance_transform_edt to ~4e-7 px, but on the Planck field 0 point-source
+    mask (111 holes, radii up to 20 px) it is wrong for 17680 of 29658 hole pixels, by up to
+    0.36 px. That propagates into the cosine blend weights and shifts the recovered SNR at
+    the 1e-3 level, so the blending routines use scipy's exact transform instead. Kept as a
+    GPU primitive for callers that can accept the approximation; measure before relying on it.
     """
     ny, nx = hole_mask.shape
 
@@ -1269,7 +1325,7 @@ def _edt_jfa_jax(hole_mask):
 
 def circular_cosine_blend_adaptive_multi(
     original_3d, inpainted_3d, mask,
-    inner_zero_frac=0.
+    inner_zero_frac=0., min_radius=0.
 ):
     """
     Vectorized blend for multi-frequency maps (nx, ny, n_freq).
@@ -1283,17 +1339,26 @@ def circular_cosine_blend_adaptive_multi(
     if not np.any(hole_mask):
         return original_3d
 
-    # Label on CPU (fast C implementation, ~2ms)
+    # Label on CPU (fast C implementation, ~2 ms)
     structure = np.array([[1,1,1], [1,1,1], [1,1,1]], dtype=bool)
     labeled_mask, n_regions = label(hole_mask, structure=structure)
 
-    # EDT on GPU via JFA (~1ms vs ~63ms scipy)
+    # Exact EDT on CPU. The GPU jump-flooding version (_edt_jfa_jax) is ~60x faster but only
+    # approximate, and its error reaches 0.36 px on the real Planck point-source mask, which
+    # moves the blend weights and the recovered SNR at the 1e-3 level. ~63 ms per tile against
+    # a ~300 s cluster-finding run is not worth that.
     hole_mask_jnp = jnp.array(hole_mask)
-    dist_jnp = _edt_jfa_jax(hole_mask_jnp)
+    dist_jnp = jnp.array(distance_transform_edt(hole_mask))
 
     # Compute region radii from areas
     region_areas = np.bincount(labeled_mask.ravel(), minlength=n_regions + 1)
     region_radii = np.sqrt(region_areas / np.pi)
+
+    # szifi skips regions smaller than min_radius, leaving them purely inpainted with no
+    # cosine taper. Setting their radius to 0 reproduces that: the annulus condition
+    # 0 < dist <= radius is then never satisfied, so w stays 0 across the region.
+    region_radii = np.where(region_radii < min_radius, 0., region_radii)
+
     radius_map = jnp.array(region_radii[labeled_mask])
 
     # Blend weights on GPU
@@ -1316,21 +1381,105 @@ def circular_cosine_blend_adaptive_multi(
     return blended
 
 
+@numba_njit(cache=True)
+def _diffusive_inpaint_gs(masked_image, x_0, y_0, n_inpaint):
+    """Raster-order Gauss-Seidel sweeps, writing in place. szifi's algorithm, exactly.
+
+    Each masked pixel is set to the mean of its in-bounds 8-neighbours, using values already
+    updated earlier in the same sweep. Out-of-bounds neighbours are excluded from both the
+    sum and the count. (szifi bounds the second index by nx rather than ny, so it is only
+    correct for square tiles; the per-axis bound used here is correct for any shape and
+    identical for square ones.)"""
+
+    nx, ny = masked_image.shape
+
+    for _ in range(n_inpaint):
+
+        for i in range(len(x_0)):
+
+            x = x_0[i]
+            y = y_0[i]
+            c = 0
+            value = masked_image.dtype.type(0.)
+
+            for dx in (-1, 0, 1):
+
+                for dy in (-1, 0, 1):
+
+                    if dx == 0 and dy == 0:
+                        continue
+
+                    xn = x + dx
+                    yn = y + dy
+
+                    if 0 <= xn < nx and 0 <= yn < ny:
+
+                        value += masked_image[xn, yn]
+                        c += 1
+
+            masked_image[x, y] = value / c
+
+    return masked_image
+
+
+def diffusive_inpaint(image, mask, n_inpaint):
+    """Diffusive inpainting, bit-compatible with szifi.
+
+    szifi sweeps the masked pixels sequentially in raster order and writes in place, i.e.
+    Gauss-Seidel. That is not GPU-parallelisable at this problem size, and it does not need
+    to be: it costs ~1 s per tile against a ~300 s cluster-finding run. The GPU Jacobi form
+    lives in diffusive_inpaint_jax and is selected with inpaint_type="diffusive_jax".
+
+    The distinction matters. With n_inpaint = 100 neither iteration is converged for the
+    larger point-source holes (Planck field 0 has holes up to ~20 px in radius), and Jacobi
+    converges about half as fast as Gauss-Seidel, so the two give visibly different maps.
+    See PORT_STATUS.md."""
+
+    image_np = np.asarray(image)
+    mask_np = np.asarray(mask, dtype=image_np.dtype)
+
+    if np.array_equal(np.ones(mask_np.shape, dtype=mask_np.dtype), mask_np):
+
+        return jnp.asarray(image_np)
+
+    masked_image = np.ascontiguousarray(image_np * mask_np)
+    x_0, y_0 = np.where(mask_np == 0.)
+
+    out = _diffusive_inpaint_gs(masked_image, x_0.astype(np.int64), y_0.astype(np.int64),
+    int(n_inpaint))
+
+    return jnp.asarray(out)
+
+
+def _sum_8_neighbours(arr):
+    """Sum of the 8 neighbours of every pixel, with out-of-bounds neighbours contributing 0."""
+    padded = jnp.pad(arr, 1, mode='constant', constant_values=0.)
+    return (padded[:-2, :-2] + padded[:-2, 1:-1] + padded[:-2, 2:] +
+            padded[1:-1, :-2] +                    padded[1:-1, 2:] +
+            padded[2:, :-2]   + padded[2:, 1:-1]  + padded[2:, 2:])
+
+
 @jax.jit
 def diffusive_inpaint_jax(image, mask, n_inpaint):
-    """Diffusive inpainting using lax.fori_loop — fully JIT-compatible."""
+    """Diffusive inpainting of the masked pixels, via lax.fori_loop.
+
+    Each masked pixel is replaced by the mean of its in-bounds 8-neighbours, n_inpaint times.
+    Out-of-bounds neighbours are excluded from both the sum and the count, so edge and corner
+    pixels average over 5 and 3 neighbours respectively — this reproduces szifi's explicit
+    bounds checks. (szifi tests the second index against nx rather than ny, so it is only
+    correct for square tiles; the per-dimension bound used here is correct for any shape.)
+
+    szifi sweeps the masked pixels sequentially in raster order and writes in place, i.e.
+    Gauss-Seidel, which is inherently sequential. This is the Jacobi form of the same
+    iteration: both converge to the same discrete harmonic extension, but they are not
+    identical at finite n_inpaint. See PORT_STATUS.md for the measured difference."""
     zeros_mask = (mask == 0.)
     masked_image = image * mask
 
+    counts = _sum_8_neighbours(jnp.ones_like(masked_image))
+
     def body_fn(_, img):
-        # Pad with edge values for boundary handling
-        padded = jnp.pad(img, 1, mode='edge')
-        # Sum 8 neighbors
-        neighbors = (padded[:-2, :-2] + padded[:-2, 1:-1] + padded[:-2, 2:] +
-                     padded[1:-1, :-2] +                      padded[1:-1, 2:] +
-                     padded[2:, :-2]   + padded[2:, 1:-1]   + padded[2:, 2:])
-        # Count valid neighbors (all 8 for interior, fewer at edges — but with edge padding, always 8)
-        avg = neighbors / 8.
+        avg = _sum_8_neighbours(img) / counts
         return jnp.where(zeros_mask, avg, img)
 
     return jax.lax.fori_loop(0, n_inpaint, body_fn, masked_image)

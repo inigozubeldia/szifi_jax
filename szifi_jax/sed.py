@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 import numpy as np
+from scipy import integrate
 from szifi_jax import params
 from szifi_jax.model import constants
 
@@ -196,8 +197,10 @@ def integrate_sed_bandpass(sed_func=None,exp=None):
         nu = jnp.array(exp.nu_transmission_list[i])
         sed = sed_func(nu)*muK_to_MJysr(nu)
 
-        sed_bandpass[i] = jnp.trapezoid(transmission*sed,nu)
-        conversion[i] = jnp.trapezoid(transmission*muK_to_MJysr(nu),nu)
+        #Simpson, as in szifi: the bandpass integral feeds tsz_sed, i.e. the MMF's spectral
+        #weights, so the quadrature rule must not be swapped for a lower-order one.
+        sed_bandpass[i] = integrate.simpson(np.asarray(transmission*sed),x=np.asarray(nu))
+        conversion[i] = integrate.simpson(np.asarray(transmission*muK_to_MJysr(nu)),x=np.asarray(nu))
 
     sed_bandpass = sed_bandpass/conversion
 

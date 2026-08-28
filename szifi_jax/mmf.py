@@ -15,7 +15,7 @@ class cluster_finder:
     data_file=None,
     rank=0):
 
-        self.params_szifi = params_szifi
+        self.params_szifi = params.normalise_params_szifi(params_szifi)
         self.params_model = params_model
         self.data_file = data_file.data #instance of input_data
         self.theta_500_vec = self.params_szifi["theta_500_vec_arcmin"]
@@ -242,31 +242,27 @@ class cluster_finder:
                 bin_fac = self.params_szifi["powspec_bin_fac"]
                 cov_type = self.params_szifi["cov_type"]
 
-                # For anisotropic cov types, skip power_spectrum init and cross-spec (not used)
-                if cov_type not in ("anisotropic_gaussian", "anisotropic_boxcar"):
-                    self.ps = spec.power_spectrum(self.pix,
-                    mask=np.asarray(self.mask_ps),
-                    cm_compute=self.params_szifi["coupling_matrix_needed"],
-                    cm_compute_scratch=self.params_szifi["compute_coupling_matrix"],
-                    cm_save=self.params_szifi["save_coupling_matrix"],
-                    cm_name=self.coupling_matrix_name,
-                    bin_fac=bin_fac,
-                    new_shape=new_shape)
+                self.ps = spec.power_spectrum(self.pix,
+                mask=np.asarray(self.mask_ps),
+                cm_compute=self.params_szifi["coupling_matrix_needed"],
+                cm_compute_scratch=self.params_szifi["compute_coupling_matrix"],
+                cm_save=self.params_szifi["save_coupling_matrix"],
+                cm_name=self.coupling_matrix_name,
+                bin_fac=bin_fac,
+                new_shape=new_shape)
 
                 self.cspec = spec.cross_spec(np.arange(len(self.params_szifi["freqs"])))
 
-                # For anisotropic cov types, skip isotropic cross-spec (not used)
-                if cov_type not in ("anisotropic_gaussian", "anisotropic_boxcar"):
-                    self.cspec.get_cross_spec(self.pix,
-                    t_map=self.t_noi,
-                    ps=self.ps,
-                    decouple_type=self.params_szifi["decouple_type"],
-                    inpaint_flag=self.params_szifi["inpaint"],
-                    mask_point=self.mask_point,
-                    lsep=self.params_szifi["lsep"],
-                    bin_fac=bin_fac,
-                    new_shape=new_shape,
-                    implementation=self.params_szifi.get("powspec_implementation", "custom"))
+                self.cspec.get_cross_spec(self.pix,
+                t_map=self.t_noi,
+                ps=self.ps,
+                decouple_type=self.params_szifi["decouple_type"],
+                inpaint_flag=self.params_szifi["inpaint"],
+                mask_point=self.mask_point,
+                lsep=self.params_szifi["lsep"],
+                bin_fac=bin_fac,
+                new_shape=new_shape,
+                implementation=self.params_szifi["powspec_implementation"])
 
                 self.inv_cov = self.cspec.get_inv_cov(self.pix,
                                                       t_map=self.t_noi,
@@ -275,7 +271,8 @@ class cluster_finder:
                                                       new_shape=new_shape,
                                                       mask=np.asarray(self.mask_ps),
                                                       cov_type=cov_type,
-                                                      cov_kernel_shape=self.params_szifi["cov_kernel_shape"]
+                                                      cov_kernel_shape=self.params_szifi["cov_kernel_shape"],
+                                                      inv_cov_backend=self.params_szifi["inv_cov_backend"]
                                                       )
 
                 del self.mask_point
@@ -341,9 +338,17 @@ class cluster_finder:
 
                 #Matched filter construction
 
-                # Cache templates across noise iterations (they only depend on theta_500, not noise)
-                if not hasattr(self, '_template_cache'):
+                #Cache templates across noise iterations (they depend on theta_500 and on the
+                #tile geometry, but not on the noise). The cache is keyed on the tile geometry
+                #and, for CAR, on the tile WCS, because CAR templates are built from the tile's
+                #own posmap and therefore differ from tile to tile.
+                self._template_cache_key = get_template_cache_key(self.pix,self.wcs,
+                self.params_szifi["tile_type"])
+
+                if getattr(self,"_template_cache_key_current",None) != self._template_cache_key:
+
                     self._template_cache = {}
+                    self._template_cache_key_current = self._template_cache_key
 
                 self.filtered_maps = filter_maps(t_obs=self.t_obs,
                 inv_cov=self.inv_cov,
@@ -574,6 +579,23 @@ def _compute_cluster_mask_jax(x_coord, y_coord, cx_arr, cy_arr, r_arr, dx, dy, n
     all_masks = jax.vmap(mask_one_cluster)(cx_arr, cy_arr, r_arr)  # (n_clusters, nx, ny)
     return jnp.all(all_masks, axis=0).astype(jnp.float64)
 
+def get_template_cache_key(pix,wcs,tile_type):
+
+    """Key identifying the tile geometry a set of MMF templates was built for.
+
+    For HEALPix tiles the template depends only on the pixelisation, which is shared by every
+    tile, so templates can be reused across fields. For CAR tiles the template is built from
+    the tile's own posmap and so depends on the tile WCS as well; reusing a cached template
+    across CAR tiles would silently apply the first tile's template everywhere."""
+
+    key = (tile_type,pix.nx,pix.ny,pix.dx,pix.dy)
+
+    if tile_type == "car" and wcs is not None:
+
+        key = key + (str(wcs.to_header()),)
+
+    return key
+
 #Construct and apply MMF
 
 class filter_maps:
@@ -628,10 +650,17 @@ class filter_maps:
         self.sigma_vec = np.zeros(n_theta)
         detect_peaks_maxima_lomem = False  # overridden in sequential fallback
 
-        # Check if batch path can be used
+        #Check whether the batched GPU path can be used. It reproduces the "maxima" /
+        #"maxima_lomem" peak finders and the standard MMF only, and it contracts the template
+        #FFT directly against inv_cov, so it requires inv_cov to be on the full map grid
+        #(i.e. no degraded power spectrum via powspec_lmax1d / powspec_new_shape).
         _cache = getattr(self, '_template_cache', {})
         all_cached = all(j in _cache for j in range(n_theta))
-        can_batch = (self.params["mmf_type"] == "standard"
+        inv_cov_full_shape = tuple(self.inv_cov.shape[:2]) == (self.pix.nx,self.pix.ny)
+        can_batch = (self.params.get("mmf_batched",True)
+                     and self.params["mmf_type"] == "standard"
+                     and self.params["detection_method"] in ("maxima","maxima_lomem")
+                     and inv_cov_full_shape
                      and not self.params["snr_weighting"]
                      and not self.params["save_snr_maps"])
 
@@ -661,7 +690,8 @@ class filter_maps:
                         z = 0.2
                         M_500 = model.get_m_500(self.theta_500_vec[j],z,self.cosmology)
                         nfw = model.gnfw(M_500,z,self.cosmology,
-                        type=self.params_model["profile_type"])
+                        type=self.params_model["profile_type"],
+                        los_integral=self.params_model["los_integral"])
                         theta_cart = [(0.5*self.pix.nx)*self.pix.dx,
                         (0.5*self.pix.nx)*self.pix.dx]
 
@@ -783,7 +813,8 @@ class filter_maps:
                         z = 0.2
                         M_500 = model.get_m_500(self.theta_500_vec[j],z,self.cosmology)
                         nfw = model.gnfw(M_500,z,self.cosmology,
-                        type=self.params_model["profile_type"])
+                        type=self.params_model["profile_type"],
+                        los_integral=self.params_model["los_integral"])
 
                         theta_cart = [(0.5*self.pix.nx)*self.pix.dx,
                         (0.5*self.pix.nx)*self.pix.dx]
@@ -873,6 +904,11 @@ class filter_maps:
 
                         self.q_tensor[:,:,1] = q_map_np
                         self.y_map_last = y_map_np
+
+                        #szifi `continue`s here before recording sigma_vec[0], so its
+                        #maxima_lomem path always reports sigma_vec[0] == 0. Record it, so
+                        #that this path agrees with the batched one.
+                        self.sigma_vec[j] = float(std)
 
                         continue
 
@@ -1049,6 +1085,7 @@ class filter_maps:
             exp=self.exp,
             comp_to_calculate=self.params["comp_to_calculate"],
             profile_type=self.params_model["profile_type"],
+            los_integral=self.params_model["los_integral"],
             indices_filter=self.indices_filter,
             tile_type=self.params["tile_type"],
             wcs=self.wcs,
@@ -1102,9 +1139,9 @@ class filter_maps:
 def extract_at_input_value(t_true,inv_cov,pix,beam,M_500,z,cosmology,norm_type,
 theta_0,theta_1,lrange,apod_type=None,mmf_type=None,cmmf_prec=None,cmmf_type=None,
 freqs=None,exp=None,comp_to_calculate=None,profile_type=None,indices_filter=None,
-tile_type="healpix",wcs=None,weights=None,filter_mask=None):
+tile_type="healpix",wcs=None,weights=None,filter_mask=None,los_integral="gauss_legendre"):
 
-    nfw = model.gnfw(M_500,z,cosmology,type=profile_type)
+    nfw = model.gnfw(M_500,z,cosmology,type=profile_type,los_integral=los_integral)
 
     q_opt = np.zeros(len(comp_to_calculate))
     y0_est = np.zeros(len(comp_to_calculate))
@@ -1228,7 +1265,8 @@ def make_detections(q_tensor,q_th,pix,detection_method="maxima"):
 
         return (i,j,theta)
 
-    return ([],[],[])
+    raise ValueError(f"detection_method \"{detection_method}\" not supported. "
+    "Allowed values are 'maxima', 'maxima_lomem' and 'DBSCAN'.")
 
 def make_detections2(qmap,ymap,mask_peak_finding,q_th,zmax):
 
@@ -1392,9 +1430,11 @@ def _get_mmf_q_maps_batch_jit(tmap, tem_batch, inv_cov, a_vec, dx, dy, pnx, pny)
     ifft_norm = jnp.sqrt((nx * ny_dim) / (dx * dy))
     dxdy = dx * dy
 
-    # Pre-compute tmap FFTs for convolution in float32 (shared across all templates)
-    tmap_f32 = tmap.astype(jnp.float32)
-    fa_tmap = jax.vmap(lambda m: jnp.fft.fft2(m, s=(pnx, pny)), in_axes=2)(tmap_f32)
+    # Pre-compute tmap FFTs for the convolution (shared across all templates). szifi runs this
+    # convolution at the map dtype (params["map_dtype"]), so follow tmap's dtype rather than
+    # forcing float32 — otherwise map_dtype=np.float64 would be silently downgraded.
+    conv_dtype = tmap.dtype
+    fa_tmap = jax.vmap(lambda m: jnp.fft.fft2(m, s=(pnx, pny)), in_axes=2)(tmap)
 
     def process_one_template(tem):
         # FFT template (same as get_fft_f) — float64 for filter precision
@@ -1411,9 +1451,9 @@ def _get_mmf_q_maps_batch_jit(tmap, tem_batch, inv_cov, a_vec, dx, dy, pnx, pny)
         # Normalization in float64
         tem_a = tem * a_vec[None, None, :]
         norm = jnp.sum(tem_a * filter_val) * dxdy
-        # Convolution in float32 for speed
-        filter_f32 = filter_val.astype(jnp.float32)
-        fb = jax.vmap(lambda m: jnp.fft.fft2(m, s=(pnx, pny)), in_axes=2)(filter_f32)
+        # Convolution at the map dtype, matching szifi's scipy.signal.fftconvolve call
+        filter_conv = filter_val.astype(conv_dtype)
+        fb = jax.vmap(lambda m: jnp.fft.fft2(m, s=(pnx, pny)), in_axes=2)(filter_conv)
         product_sum = jnp.sum(fa_tmap * fb, axis=0)
         conv = jnp.fft.ifft2(product_sum).real
         start0 = (nx - 1) // 2

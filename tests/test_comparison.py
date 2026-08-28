@@ -1,176 +1,289 @@
 """
-Test script comparing szifi (original NumPy) vs szifi_jax (JAX port).
-Runs both on Planck field 0 data and compares:
-1. Cross-spectra (spec_tensor)
-2. Inverse covariance (inv_cov)
-3. SNR maps (q_map) per theta_500 scale
-4. Detection catalogues
-5. sigma_vec values
+End-to-end comparison of szifi (NumPy/CPU) against szifi_jax (JAX/GPU) on Planck field 0.
+
+Every parameter is pinned explicitly and identically on both sides. This matters: the two
+packages' own defaults are not interchangeable (szifi's params.py misspells "snr_weigthing"
+while its mmf.py reads "snr_weighting", and szifi_jax adds "powspec_implementation"), so a
+comparison that starts from each package's defaults is not comparing the same analysis.
+
+szifi_jax is run twice:
+  "parity"  — los_integral="quad", i.e. szifi's own line-of-sight quadrature. This is the
+              configuration in which the port claims to reproduce szifi, and it is held to
+              machine precision.
+  "default" — los_integral="gauss_legendre". szifi's quad call is 1e-7..1e-4 inaccurate near
+              the profile centre (see tests/test_parity_units.py), so the default templates
+              differ from szifi's by ~4e-6. That is szifi's error, not the port's, and it
+              cancels out of q, which is invariant to template normalisation.
+
+Compared, in the order the pipeline produces them:
+  1. noise cross-spectra          cspec.spec_tensor
+  2. inverse noise covariance     cf.inv_cov
+  3. filter normalisations        filtered_maps.sigma_vec
+  4. SNR maps                     q_tensor / q maps per theta_500
+  5. detection catalogues         q_opt, theta_500, positions, y0
+
+Usage:  python tests/test_comparison.py [n_theta]
 """
 
 import os
-os.environ["OMP_NUM_THREADS"] = "10"
-os.environ["OPENBLAS_NUM_THREADS"] = "10"
-os.environ["MKL_NUM_THREADS"] = "10"
+import subprocess
+import sys
+
+
+def _pick_gpu():
+    """Select the GPU with the most free VRAM, as the shared box requires."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+            text=True)
+        rows = [line.split(",") for line in out.strip().splitlines()]
+        return min(rows, key=lambda r: int(r[1]))[0].strip()
+    except Exception:
+        return "0"
+
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", _pick_gpu())
 os.environ["XLA_FLAGS"] = ""
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Use GPU 1 (GPU 0 is mostly full)
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("OMP_NUM_THREADS", "10")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "10")
+os.environ.setdefault("MKL_NUM_THREADS", "10")
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-# Disable TF GPU to avoid Blackwell conflicts
-import tensorflow as tf
-tf.config.set_visible_devices([], 'GPU')
+import tensorflow as tf                                     # noqa: E402
+tf.config.set_visible_devices([], 'GPU')                    # Blackwell: TF GPU is broken
 
-import sys
-# Ensure installed packages are used, not cwd
 sys.path = [p for p in sys.path if p not in ('', '.')]
 
-import numpy as np
-import time
-import copy
-
-# ---- Run original szifi ----
-
-print("="*60)
-print("Running original szifi")
-print("="*60)
-
-import szifi
-
-params_szifi_orig = copy.deepcopy(szifi.params_szifi_default)
-params_data_orig = copy.deepcopy(szifi.params_data_default)
-params_model_orig = copy.deepcopy(szifi.params_model_default)
-
-params_szifi_orig["path"] = "/scratch/scratch-izubeldia/szifi_project/szifi/"
-params_szifi_orig["path_data"] = "/scratch/scratch-izubeldia/szifi_project/szifi/data/"
-params_szifi_orig["survey_file"] = "/scratch/scratch-izubeldia/szifi_project/szifi/surveys/data_planck.py"
-params_szifi_orig["save_and_load_template"] = False
-params_szifi_orig["snr_weighting"] = False
-
-params_data_orig["field_ids"] = [0]
-
-t0 = time.time()
-data_orig = szifi.input_data(params_szifi=params_szifi_orig, params_data=params_data_orig)
-cf_orig = szifi.cluster_finder(params_szifi=params_szifi_orig, params_model=params_model_orig, data_file=data_orig, rank=0)
-cf_orig.find_clusters()
-t_orig = time.time() - t0
-print(f"\nOriginal szifi time: {t_orig:.2f}s")
-
-# Save original results for comparison
-results_orig = cf_orig.results_dict
-sigma_vec_orig = cf_orig.filtered_maps.sigma_vec.copy()
-
-# Get detection catalogues
-dp_orig = szifi.detection_processor(results_orig, params_szifi_orig)
-cat_noit_orig = dp_orig.results.catalogues["catalogue_find_0"]
-cat_it_orig = dp_orig.results.catalogues.get("catalogue_find_1", szifi.cluster_catalogue())
-
-print(f"Original detections (noit): {len(cat_noit_orig.catalogue['q_opt'])}")
-if hasattr(cat_it_orig, 'catalogue') and len(cat_it_orig.catalogue['q_opt']) > 0:
-    print(f"Original detections (it): {len(cat_it_orig.catalogue['q_opt'])}")
-print(f"Original sigma_vec: {sigma_vec_orig}")
-
-# ---- Run szifi_jax ----
-
-print("\n" + "="*60)
-print("Running szifi_jax")
-print("="*60)
-
-import jax
+import copy                                                 # noqa: E402
+import time                                                 # noqa: E402
+import numpy as np                                          # noqa: E402
+import jax                                                  # noqa: E402
 jax.config.update("jax_enable_x64", True)
 
-import szifi_jax
+print(f"CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}  jax devices: {jax.devices()}")
 
-params_szifi_jax = copy.deepcopy(szifi_jax.params_szifi_default)
-params_data_jax = copy.deepcopy(szifi_jax.params_data_default)
-params_model_jax = copy.deepcopy(szifi_jax.params_model_default)
+N_THETA = int(sys.argv[1]) if len(sys.argv) > 1 else 8
+ROOT = "/scratch/scratch-izubeldia/szifi_project/szifi/"
 
-params_szifi_jax["path"] = "/scratch/scratch-izubeldia/szifi_project/szifi/"
-params_szifi_jax["path_data"] = "/scratch/scratch-izubeldia/szifi_project/szifi/data/"
-params_szifi_jax["survey_file"] = "/scratch/scratch-izubeldia/szifi_project/szifi/surveys/data_planck.py"
-params_szifi_jax["save_and_load_template"] = False
-params_szifi_jax["snr_weighting"] = False
+# ---------------------------------------------------------------------------------------
+# One parameter set, used verbatim by both packages.
+# ---------------------------------------------------------------------------------------
+COMMON = {
+    "theta_500_vec_arcmin": np.exp(np.linspace(np.log(0.5), np.log(15.), N_THETA)),
+    "q_th": 4.,
+    "q_th_noise": 4.,
+    "mask_radius": 3.,
+    "iterative": True,
+    "max_it": 1,
 
-params_data_jax["field_ids"] = [0]
+    "decouple_type": "master",
+    "save_coupling_matrix": False,
+    "compute_coupling_matrix": True,
+    "coupling_matrix_needed": True,
+    "powspec_lmax1d": None,
+    "powspec_new_shape": None,
+    "powspec_bin_fac": 4,
+    "cov_type": "isotropic",
+    "cov_kernel_shape": [4., 4.],
+    "snr_weighting": False,
 
-t0 = time.time()
-data_jax = szifi_jax.input_data(params_szifi=params_szifi_jax, params_data=params_data_jax)
-cf_jax = szifi_jax.cluster_finder(params_szifi=params_szifi_jax, params_model=params_model_jax, data_file=data_jax, rank=0)
-cf_jax.find_clusters()
-t_jax = time.time() - t0
-print(f"\nszifi_jax time: {t_jax:.2f}s")
+    "lrange": [100, 2500],
+    "freqs": [0, 1, 2, 3, 4, 5],
+    "beam": "real",
 
-# Save jax results
-results_jax = cf_jax.results_dict
-sigma_vec_jax = np.asarray(cf_jax.filtered_maps.sigma_vec)
+    "interp_type": "nearest",
+    "n_inpaint": 100,
+    "inpaint_type": "diffusive",
+    "inpaint": True,
+    "lsep": 3000,
+    "max_radius_mask_arcmin": np.inf,
+    "min_radius_mask_arcmin": 0.,
 
-# Get detection catalogues
-dp_jax = szifi_jax.detection_processor(results_jax, params_szifi_jax)
-cat_noit_jax = dp_jax.results.catalogues["catalogue_find_0"]
-cat_it_jax = dp_jax.results.catalogues.get("catalogue_find_1", szifi_jax.cluster_catalogue())
+    "extraction_mode": "find",
+    "get_q_true": False,
+    "theta_500_input": None,
+    "norm_type": "centre",
+    "min_ftile": 0.3,
+    "tilemask_mode": "field",
+    "tilemask_buffer_arcmin": 10.,
+    "tile_type": "healpix",
+    "theta_find": "input",
+    "detection_method": "maxima_lomem",
+    "apod_type": "old",
 
-print(f"JAX detections (noit): {len(cat_noit_jax.catalogue['q_opt'])}")
-if hasattr(cat_it_jax, 'catalogue') and len(cat_it_jax.catalogue['q_opt']) > 0:
-    print(f"JAX detections (it): {len(cat_it_jax.catalogue['q_opt'])}")
-print(f"JAX sigma_vec: {sigma_vec_jax}")
+    "path": ROOT,
+    "path_data": ROOT + "data/",
+    "survey_file": ROOT + "surveys/data_planck.py",
+    "save_and_load_template": False,
+    "path_template": ROOT + "data/",
+    "map_dtype": np.float32,
 
-# ---- Comparisons ----
+    "mmf_type": "standard",
+    "cmmf_type": "one_dep",
+    "a_matrix": None,
+    "comp_to_calculate": [0],
+    "deproject_cib": None,
+    "integrate_bandpass": True,
+    "save_snr_maps": False,
+    "snr_maps_name": None,
+    "snr_maps_path": None,
+    "get_lonlat": True,
+    "cosmology": "Planck15",
+    "cosmology_tool": "astropy",
+    "rSZ": False,
+}
 
-print("\n" + "="*60)
-print("Comparison Results")
-print("="*60)
+# szifi_jax adds this key; "pymaster" is the estimator szifi always uses.
+JAX_ONLY = {"powspec_implementation": "pymaster", "inv_cov_backend": "numpy"}
 
-# 1. sigma_vec comparison
-print("\n--- sigma_vec comparison ---")
-sigma_diff = np.abs(sigma_vec_orig - sigma_vec_jax)
-sigma_reldiff = sigma_diff / np.abs(sigma_vec_orig)
-print(f"Max abs diff: {np.max(sigma_diff):.2e}")
-print(f"Max rel diff: {np.max(sigma_reldiff):.2e}")
-for i in range(len(sigma_vec_orig)):
-    print(f"  theta[{i}]: orig={sigma_vec_orig[i]:.8e}, jax={sigma_vec_jax[i]:.8e}, rel_diff={sigma_reldiff[i]:.2e}")
+PARAMS_DATA = {"data_set": "Planck_real", "field_ids": [0],
+               "other_params": {"components": ["tSZ", "kSZ", "CIB", "CMB", "noise"]}}
 
-# 2. Detection catalogue comparison (non-iterative)
-print("\n--- Detection catalogue comparison (non-iterative) ---")
-n_orig = len(cat_noit_orig.catalogue["q_opt"])
-n_jax = len(cat_noit_jax.catalogue["q_opt"])
-print(f"N detections: orig={n_orig}, jax={n_jax}")
 
-if n_orig > 0 and n_jax > 0:
-    # Sort by q_opt for comparison
-    idx_orig = np.argsort(cat_noit_orig.catalogue["q_opt"])[::-1]
-    idx_jax = np.argsort(cat_noit_jax.catalogue["q_opt"])[::-1]
+def run(pkg, extra=None, model_extra=None):
+    params_szifi = copy.deepcopy(COMMON)
+    if extra:
+        params_szifi.update(extra)
+    params_model = copy.deepcopy(pkg.params_model_default)
+    if model_extra:
+        params_model.update(model_extra)
+    params_data = copy.deepcopy(PARAMS_DATA)
 
-    n_compare = min(n_orig, n_jax, 10)
-    print(f"Top {n_compare} detections:")
-    for i in range(n_compare):
-        q_o = cat_noit_orig.catalogue["q_opt"][idx_orig[i]]
-        q_j = cat_noit_jax.catalogue["q_opt"][idx_jax[i]]
-        t_o = cat_noit_orig.catalogue["theta_500"][idx_orig[i]]
-        t_j = cat_noit_jax.catalogue["theta_500"][idx_jax[i]]
-        print(f"  #{i}: q_orig={q_o:.4f}, q_jax={q_j:.4f}, theta_orig={t_o:.4f}, theta_jax={t_j:.4f}")
+    data = pkg.input_data(params_szifi=params_szifi, params_data=params_data)
+    cf = pkg.cluster_finder(params_szifi=params_szifi, params_model=params_model,
+                            data_file=data, rank=0)
+    t0 = time.time()
+    cf.find_clusters()
+    elapsed = time.time() - t0
 
-# 3. Timing comparison
-print("\n--- Timing ---")
-print(f"Original: {t_orig:.2f}s")
-print(f"JAX:      {t_jax:.2f}s")
-print(f"Speedup:  {t_orig/t_jax:.2f}x")
+    dp = pkg.detection_processor(cf.results_dict, params_szifi)
+    catalogue = dp.results.catalogues["catalogue_find_0"]
+    return cf, catalogue, elapsed
 
-# 4. Summary
-print("\n--- Summary ---")
-all_pass = True
 
-if np.max(sigma_reldiff) < 2e-3:
-    print(f"PASS: sigma_vec matches (rel diff {np.max(sigma_reldiff):.2e} < 2e-3)")
-else:
-    print(f"WARN: sigma_vec rel diff = {np.max(sigma_reldiff):.2e}")
-    all_pass = False
+print("\n" + "=" * 78)
+print(f"Running szifi (NumPy/CPU), n_theta={N_THETA}")
+print("=" * 78)
+import szifi                                                # noqa: E402
+cf_np, cat_np, t_np = run(szifi)
 
-if n_orig == n_jax:
-    print(f"PASS: Same number of detections ({n_orig})")
-else:
-    print(f"WARN: Different number of detections (orig={n_orig}, jax={n_jax})")
-    all_pass = False
+print("\n" + "=" * 78)
+print(f"Running szifi_jax (JAX/GPU), n_theta={N_THETA}")
+print("=" * 78)
+import szifi_jax                                            # noqa: E402
+cf_jx, cat_jx, t_jx = run(szifi_jax, JAX_ONLY, {"los_integral": "quad"})
 
-if all_pass:
-    print("\nAll tests PASSED!")
-else:
-    print("\nSome tests had warnings - check details above.")
+print("\n" + "=" * 78)
+print(f"Running szifi_jax (JAX/GPU) with default Gauss-Legendre quadrature, n_theta={N_THETA}")
+print("=" * 78)
+cf_gl, cat_gl, t_gl = run(szifi_jax, JAX_ONLY)
+
+# ---------------------------------------------------------------------------------------
+RESULTS = []
+
+
+def compare(name, a, b, tol, mode="rel"):
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    if a.shape != b.shape:
+        print(f"  [FAIL] {name:44s} shape mismatch {a.shape} vs {b.shape}")
+        RESULTS.append((name, np.inf, tol, False))
+        return
+    d = np.abs(a - b)
+    scale = np.abs(a).max() if mode == "rel" else 1.
+    val = (d / scale).max() if scale > 0 else d.max()
+    ok = val <= tol
+    RESULTS.append((name, val, tol, ok))
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name:44s} {val:.3e}  (tol {tol:.1e}, max-{mode})")
+
+
+print("\n" + "=" * 78)
+print("Comparison")
+print("=" * 78)
+
+print("\n--- 1. noise cross-spectra (spec_tensor) ---")
+st_np = np.asarray(cf_np.cspec.spec_tensor)
+st_jx = np.asarray(cf_jx.cspec.spec_tensor)
+print(f"    shape {st_np.shape}; szifi range [{st_np.min():.4e}, {st_np.max():.4e}]")
+compare("spec_tensor", st_np, st_jx, 1e-13)
+
+print("\n--- 2. inverse noise covariance (inv_cov) ---")
+ic_np = np.asarray(cf_np.inv_cov)
+ic_jx = np.asarray(cf_jx.inv_cov)
+d_ic = np.abs(ic_np - ic_jx).max(axis=(2, 3)) / max(np.abs(ic_np).max(), 1e-300)
+print(f"    shape {ic_np.shape}; szifi |inv_cov| max {np.abs(ic_np).max():.4e}")
+print(f"    per-mode rel diff percentiles: "
+      + "  ".join(f"p{q}={np.percentile(d_ic, q):.2e}" for q in (50, 90, 99, 99.9, 100)))
+print("    (the covariance is numerically singular at some modes, so a max over all of them")
+print("     is set by the worst-conditioned handful; percentiles show the bulk)")
+compare("inv_cov", ic_np, ic_jx, 1e-9)
+
+print("\n--- 3. filter normalisations (sigma_vec) ---")
+sv_np = np.asarray(cf_np.filtered_maps.sigma_vec)
+sv_jx = np.asarray(cf_jx.filtered_maps.sigma_vec)
+for i, (a, b) in enumerate(zip(sv_np, sv_jx)):
+    rel = abs(a - b) / abs(a) if a != 0 else np.inf
+    print(f"    theta[{i}] = {COMMON['theta_500_vec_arcmin'][i]:7.3f}'  "
+          f"szifi={a:.10e}  jax={b:.10e}  rel={rel:.2e}")
+
+# szifi's maxima_lomem path `continue`s at j == 0 before recording sigma_vec[0], so it always
+# reports zero there. The port records it. Compare the entries szifi actually fills.
+skip0 = (COMMON["detection_method"] == "maxima_lomem" and len(sv_np) > 3 and sv_np[0] == 0.)
+if skip0:
+    print("    (szifi leaves sigma_vec[0] == 0: its maxima_lomem path skips the assignment;")
+    print("     the port records it, so index 0 is excluded from the comparison)")
+compare("sigma_vec", sv_np[1:] if skip0 else sv_np,
+        sv_jx[1:] if skip0 else sv_jx, 1e-12)
+
+sv_gl = np.asarray(cf_gl.filtered_maps.sigma_vec)
+print("    with the default Gauss-Legendre quadrature (szifi's quad is the less accurate one):")
+for i, (a, b) in enumerate(zip(sv_np, sv_gl)):
+    if a:
+        print(f"      theta[{i}] rel = {abs(a - b) / abs(a):.2e}")
+
+print("\n--- 4. detection catalogues ---")
+q_np = np.asarray(cat_np.catalogue["q_opt"])
+q_jx = np.asarray(cat_jx.catalogue["q_opt"])
+print(f"    n detections: szifi={len(q_np)}  szifi_jax={len(q_jx)}")
+RESULTS.append(("n detections equal", 0. if len(q_np) == len(q_jx) else 1., 0., len(q_np) == len(q_jx)))
+print(f"  [{'PASS' if len(q_np) == len(q_jx) else 'FAIL'}] {'n detections equal':44s} "
+      f"{len(q_np)} vs {len(q_jx)}")
+
+if len(q_np) and len(q_np) == len(q_jx):
+    o_np = np.argsort(-q_np)
+    o_jx = np.argsort(-q_jx)
+    fields = ["q_opt", "theta_500", "y0", "theta_x", "theta_y"]
+    print(f"    {'#':>3} " + "".join(f"{f:>24}" for f in fields))
+    for i in range(min(10, len(q_np))):
+        row = f"    {i:>3} "
+        for f in fields:
+            a = np.asarray(cat_np.catalogue[f])[o_np[i]]
+            b = np.asarray(cat_jx.catalogue[f])[o_jx[i]]
+            row += f"{a:>11.5f}/{b:<12.5f}"
+        print(row)
+    # map_dtype defaults to float32, and szifi runs the matched-filter convolution at that
+    # dtype, so ~1e-7 is the floor for anything downstream of it.
+    TOL = {"q_opt": 1e-6, "theta_500": 0., "y0": 1e-6, "theta_x": 0., "theta_y": 0.}
+    for f in fields:
+        compare(f"catalogue {f}", np.asarray(cat_np.catalogue[f])[o_np],
+                np.asarray(cat_jx.catalogue[f])[o_jx], TOL[f])
+
+    q_gl = np.asarray(cat_gl.catalogue["q_opt"])
+    if len(q_gl) == len(q_np):
+        print(f"    q_opt with default Gauss-Legendre quadrature: max rel diff "
+              f"{np.abs(np.sort(q_np)[::-1] - np.sort(q_gl)[::-1]).max() / np.abs(q_np).max():.3e}")
+
+print("\n--- 5. timing ---")
+print(f"    szifi (CPU): {t_np:.2f}s")
+print(f"    szifi_jax (GPU, parity config, incl. JIT compilation): {t_jx:.2f}s")
+print(f"    szifi_jax (GPU, default config, warm JIT cache): {t_gl:.2f}s")
+print(f"    ratio (default, warm): {t_np / t_gl:.2f}x")
+
+print("\n" + "=" * 78)
+n_fail = sum(1 for _, _, _, ok in RESULTS if not ok)
+for name, value, tol, ok in RESULTS:
+    print(f"  {'PASS' if ok else 'FAIL'}  {name:44s} {value:.3e} <= {tol:.1e}")
+print("=" * 78)
+print(f"{len(RESULTS) - n_fail}/{len(RESULTS)} checks passed")
+sys.exit(1 if n_fail else 0)

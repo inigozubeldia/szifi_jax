@@ -124,7 +124,13 @@ def filter_sum(rec,tem,noi):
 
 def div0(a,b):
 
-    return jnp.where(b != 0., a / b, 0.)
+    """a/b with every non-finite result replaced by zero, as in szifi's
+    np.true_divide + c[~np.isfinite(c)] = 0. Testing b != 0 is not equivalent: it lets a
+    nan numerator through, and it keeps an overflow-to-inf that szifi would have zeroed."""
+
+    c = jnp.where(b != 0., a / jnp.where(b != 0., b, 1.), 0.)
+
+    return jnp.where(jnp.isfinite(c), c, 0.)
 
 def get_cmmf_std(pix,mmf_type,inv_cov,filter_fft,norm):
 
