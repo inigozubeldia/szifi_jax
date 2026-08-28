@@ -13,40 +13,70 @@ than taken on trust.
 
 ## 1. Where the port stands
 
-Configured to use szifi's own line-of-sight quadrature (`los_integral="quad"`), the port
-reproduces szifi on Planck field 0 to:
+Both packages on their own defaults, the port reproduces szifi on Planck field 0 to:
 
 | quantity | agreement |
 |---|---|
 | noise cross-spectra `spec_tensor` | 9.7e-17 |
-| inverse noise covariance `inv_cov` | 1.0e-10 (p50 6.1e-13) |
-| filter normalisations `sigma_vec` | **7.2e-15** |
-| detected `q_opt` | 3.7e-8 |
-| detected `y0` | 2.5e-8 |
+| inverse noise covariance `inv_cov` | 1.2e-10 (p50 6.1e-13) |
+| filter normalisations `sigma_vec` | **3.3e-15** |
+| detected `q_opt` | 3.8e-8 |
+| detected `y0` | 3.2e-8 |
 | detected `theta_500`, `theta_x`, `theta_y` | **exact** |
 | number of detections | equal |
 
 (`tests/test_comparison.py`, 9/9 passing: MASTER decoupling, 8 `theta_500` scales, one
-iterative noise step, all parameters pinned identically on both sides.)
+iterative noise step, all parameters pinned identically on both sides.) Note that szifi is not
+bit-reproducible run to run — pymaster's FFTW planning moves `spec_tensor` by ~4e-12 between
+two identical runs — so that is the floor for the power spectra, not the port's doing.
 
-3.7e-8 on `q_opt` is the float32 floor: `map_dtype` defaults to `np.float32` and szifi runs
+3.8e-8 on `q_opt` is the float32 floor: `map_dtype` defaults to `np.float32` and szifi runs
 the matched-filter convolution at that dtype, so nothing downstream of it can do better than
 ~1e-7. `inv_cov`'s 1.0e-10 tail is set by the modes where the noise covariance is numerically
 singular (`|inv_cov|` reaches 2.9e14); the bulk agrees to 6e-13.
 
 ### Speed
 
-Honest numbers for the run above (Planck field 0, 8 scales, one noise iteration):
-szifi 320.6 s, szifi_jax 302.0 s with a warm JIT cache — **1.06x**. The matched filter itself
-is much faster on the GPU, but it is no longer what dominates: pymaster's MASTER coupling
-matrix, the exact Gauss-Seidel inpainting, and the CPU covariance inversion do. Making this
-port meaningfully faster means validating and switching on the all-JAX power-spectrum
-estimator (`powspec_implementation="custom"`, §5) — not further work on the MMF. The GPU win
-grows with the number of `theta_500` scales, since those are the part that batches.
+The port is **11.4x** faster than szifi on everything it ported: 2.7 s against 30.2 s for
+Planck field 0 with 8 scales and one noise iteration, with the MASTER coupling matrix reused
+from disk (`compute_coupling_matrix=False`, `save_coupling_matrix=True` — the workflow szifi
+is designed around). Cold, before the JIT cache is warm, the port takes 5.5 s.
 
-With the default `los_integral="gauss_legendre"` the templates differ from szifi's by ~3.7e-6.
-That is **szifi's** error, not the port's — see §3.1 — and it cancels out of `q`, which is
-invariant to template normalisation (`q_opt` agreement is 3.4e-8 either way).
+An earlier revision of this document reported 1.06x. That was an artefact of benchmarking with
+`compute_coupling_matrix=True`, which forces NaMaster to rebuild the mode-coupling matrix on
+every run. Profiling settled it:
+
+| stage | time | share |
+|---|---|---|
+| `nmt.compute_coupling_matrix` (2 calls) | 277.5 s | **97.2%** |
+| cross-spectra, 42 frequency pairs | 2.3 s | 0.8% |
+| templates | 1.1 s | 0.4% |
+| `np.linalg.inv` of the covariance | 0.9 s | 0.3% |
+| inpainting | 0.8 s | 0.3% |
+| **the entire batched MMF** | **0.71 s** | **0.25%** |
+
+Two of those numbers are the story. The matched filter — the reason the port exists — is
+0.25% of the runtime, so no amount of further GPU work on it matters. And the coupling matrix
+was being computed **twice per field with identical inputs**: it depends only on `mask_ps`,
+the pixelisation and the binning, none of which change with the noise iteration, but it was
+constructed inside the iteration loop. Hoisting it out (done here and upstreamed to szifi)
+is exactly neutral and takes both codes from ~320 s to ~170 s on its own.
+
+Three optimisations came out of this, all exact and all applied to szifi as well:
+
+* **The coupling matrix is built once per field**, not once per noise iteration. ~1.9x.
+* **NaMaster fields are built once per frequency**, not once per frequency *pair*. The
+  cross-spectrum loop asks for every ordered pair, so it was constructing 42 `NmtFieldFlat`
+  objects for 6 channels instead of 6.
+* **The line-of-sight pressure integral is vectorised** (§3.1), which is 40x faster at
+  tabulating a profile than 1000 separate `scipy.integrate.quad` calls and takes szifi from
+  43.9 s to 31.6 s in the no-coupling-matrix configuration.
+
+If the coupling matrix does have to be computed, it is ~139 s per tile and dwarfs everything
+else. Reuse it. The remaining lever, if that is still too slow, is the all-JAX power-spectrum
+estimator (`powspec_implementation="custom"`, §5), which avoids NaMaster entirely — but it
+does not implement MASTER decoupling, so it is a different estimator and is **not yet
+validated**. Do not switch it on without checking it against the pymaster path first.
 
 ## 2. Coverage
 
@@ -121,19 +151,26 @@ diverged from szifi identically), and the `np.linalg.inv` / `jnp.linalg.inv` bac
 maps by 1 ULP moves `sigma_vec` by 3.4e-15 and `q_opt` by exactly zero — so the residual could
 never have been dismissed as numerical noise.
 
-### 3.1 The one place the port deliberately differs
+### 3.1 The line-of-sight quadrature, now shared with szifi
 
-`gnfw.get_p_cal_int`. szifi integrates the pressure profile over the full
-`[-R_truncation, R_truncation]` with `scipy.integrate.quad`, without telling `quad` where the
-integrand's truncation edge or its central cusp are. Measured against a 40-digit mpmath
-reference, szifi's call is wrong by 3.7e-6 at r=1e-8 and 9.0e-5 at r=1e-6 (Arnaud, the central
-cusp — and r→0 is exactly what sets the template normalisation), and by 8.7e-6 at r=3 rising
-to **0.21 at r=4.99** for Battaglia, where the profile has fallen 21 orders of magnitude and
+szifi integrated the pressure profile over the full `[-R_truncation, R_truncation]` with
+`scipy.integrate.quad`, without telling `quad` where the integrand's truncation edge or its
+central cusp are. Measured against a 40-digit mpmath reference, that call returns **`inf` at
+r=0**, is wrong by 3.7e-6 at r=1e-8 and 9.0e-5 at r=1e-6 (Arnaud, the central cusp — and
+r→0 is exactly what sets the template normalisation via `get_y_norm("centre")`), and by up to
+**21% at r=4.99** for Battaglia, where the profile has fallen 21 orders of magnitude and
 `quad`'s absolute tolerance is meaningless.
 
-The port integrates over the support only, with a `z = Z(r)·t⁷` substitution and 512
-Gauss-Legendre nodes: **1.1e-12** (Arnaud) and **2.5e-14** (Battaglia) against mpmath, batched
-on the GPU. Set `params_model["los_integral"] = "quad"` to reproduce szifi bit-for-bit instead.
+The replacement integrates over the support only, with a `z = Z(r)·t⁷` substitution and 512
+Gauss-Legendre nodes: **1.1e-12** (Arnaud) and **2.5e-14** (Battaglia) against mpmath. It is
+also 40x faster, because it evaluates all radii at once instead of making 1000 adaptive `quad`
+calls per template.
+
+**This has been upstreamed into szifi**, so both codes now use it and their defaults agree.
+The change is invisible in the detections — szifi's `q_opt`, `theta_500` and positions are
+bit-identical before and after, because `q` is invariant to template normalisation — and moves
+`sigma_vec` and `y0` by 3.7e-6, which is the error being corrected. Set
+`params_model["los_integral"] = "quad"` on either side to fall back to the old behaviour.
 
 ## 4. Verified agreement, routine by routine
 
@@ -170,7 +207,7 @@ misspelled `snr_weigthing` key, so a params dict written against either package 
 | `powspec_implementation` | `"pymaster"` (what szifi always uses) | `"custom"`, an all-JAX estimator, **not yet validated** |
 | `inv_cov_backend` | `"numpy"` (LAPACK, as szifi) | `"jax"` (cuSOLVER, stays on device) |
 | `mmf_batched` | `True` | `False`, filter each `theta_500` sequentially |
-| `params_model["los_integral"]` | `"gauss_legendre"` | `"quad"`, szifi's exact call (§3.1) |
+| `params_model["los_integral"]` | `"gauss_legendre"` (now also szifi's default) | `"quad"`, szifi's pre-fix call (§3.1) |
 
 `inpaint_type` gains `"diffusive_jax"` alongside szifi's `"diffusive"` and `"orphics"`.
 
@@ -276,9 +313,9 @@ Not yet exercised by any test:
 1. Extend `tests/test_comparison.py` to CAR tiles and a multi-field run.
 2. Exercise the spectrally-constrained MMF and `max_it > 1`; give `utils.invert_cov` the same
    backend switch as `spec.get_inv_cov`.
-3. Validate `powspec_implementation="custom"` against the pymaster/MASTER path, then decide
-   whether it can become the default. That is the largest remaining speed-up: pymaster is a
-   substantial fraction of the wall clock.
+3. Validate `powspec_implementation="custom"` against the pymaster/MASTER path. This is the
+   only remaining large lever, and only for runs that cannot reuse a coupling matrix; note it
+   does not implement MASTER decoupling, so it is a different estimator, not a drop-in.
 4. Port `reshape_ell_matrix` and `resample_fft` to JAX and lift the `inv_cov` shape
    restriction on the batched MMF.
 5. Move noise generation to `jax.random` so simulations are reproducible and jittable.

@@ -191,6 +191,34 @@ class cluster_finder:
 
                 self.t_true = maps.filter_tmap(self.t_true,self.pix,self.params_szifi["lrange"],filter_mask=self.filter_mask)
 
+            #Power-spectrum setup. The coupling matrix depends only on mask_ps, the
+            #pixelisation and the binning, none of which change with the noise iteration, so
+            #build it once per field rather than once per iteration. On Planck field 0 that
+            #single NaMaster call is ~139 s, i.e. 97% of the runtime, so recomputing it for
+            #every iteration doubled the cost of the whole cluster finder for nothing.
+
+            lmax1d = self.params_szifi["powspec_lmax1d"]
+            new_shape = self.params_szifi["powspec_new_shape"]
+
+            if lmax1d is not None:
+
+                if new_shape is not None:
+
+                    raise ValueError("Only one of powspec_lmax1d or powspec_new_shape can be specified")
+
+                new_shape = maps.get_newshape_lmax1d((self.pix.nx,self.pix.ny),lmax1d,self.pix.dx)
+
+            bin_fac = self.params_szifi["powspec_bin_fac"]
+
+            self.ps = spec.power_spectrum(self.pix,
+            mask=np.asarray(self.mask_ps),
+            cm_compute=self.params_szifi["coupling_matrix_needed"],
+            cm_compute_scratch=self.params_szifi["compute_coupling_matrix"],
+            cm_save=self.params_szifi["save_coupling_matrix"],
+            cm_name=self.coupling_matrix_name,
+            bin_fac=bin_fac,
+            new_shape=new_shape)
+
             #Initiate loop over iterative noise covariance estimation
 
             i = 0
@@ -228,28 +256,7 @@ class cluster_finder:
 
                 #Estimate channel cross-spectra
 
-                lmax1d = self.params_szifi["powspec_lmax1d"]
-                new_shape = self.params_szifi["powspec_new_shape"]
-
-                if lmax1d is not None:
-
-                    if new_shape is not None:
-
-                        raise ValueError("Only one of powspec_lmax1d or powspec_new_shape can be specified")
-
-                    new_shape = maps.get_newshape_lmax1d((self.pix.nx,self.pix.ny),lmax1d,self.pix.dx)
-
-                bin_fac = self.params_szifi["powspec_bin_fac"]
                 cov_type = self.params_szifi["cov_type"]
-
-                self.ps = spec.power_spectrum(self.pix,
-                mask=np.asarray(self.mask_ps),
-                cm_compute=self.params_szifi["coupling_matrix_needed"],
-                cm_compute_scratch=self.params_szifi["compute_coupling_matrix"],
-                cm_save=self.params_szifi["save_coupling_matrix"],
-                cm_name=self.coupling_matrix_name,
-                bin_fac=bin_fac,
-                new_shape=new_shape)
 
                 self.cspec = spec.cross_spec(np.arange(len(self.params_szifi["freqs"])))
 

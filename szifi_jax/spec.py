@@ -158,9 +158,14 @@ class power_spectrum:
                 print("Coupling matrix not found")
                 self.get_coupling_matrix()
 
+                #cm_name is only populated when compute_coupling_matrix is False, so asking to
+                #save while forcing recomputation used to call write_to(None) and crash. Warn
+                #instead: computing the coupling matrix is by far the most expensive step, so
+                #silently discarding it is worth flagging.
                 if cm_save == True:
 
-                    self.w00.write_to(cm_name)
+                    print("Coupling matrix not saved: no cm_name. To compute it once and reuse "
+                    "it, set compute_coupling_matrix=False and save_coupling_matrix=True.")
 
             elif os.path.isfile(cm_name) == False:
 
@@ -200,7 +205,24 @@ class power_spectrum:
 
     #Note: map1 is UNMASKED
 
-    def get_power_spectrum(self,map1,map2=None,decouple_type="none",implementation="pymaster"):
+
+    def get_nmt_field(self,map_value):
+
+        """NmtFieldFlat for one frequency map, degraded first if new_shape is set.
+
+        get_cross_spec asks for every ordered pair of frequencies, so building the field
+        inside get_power_spectrum rebuilds each frequency's field n_freq times -- 42 field
+        constructions for 6 channels instead of 6. Build them once and pass them in."""
+
+        if self.new_shape is not None:
+
+            map_value = maps.degrade_map(map_value,self.new_shape)
+
+        return nmt.NmtFieldFlat(self.pix.nx*self.pix.dx,self.pix.ny*self.pix.dy,self.mask,
+        [np.asarray(map_value)])
+
+    def get_power_spectrum(self,map1,map2=None,decouple_type="none",implementation="pymaster",
+    f1=None,f2=None):
         if self.new_shape is not None:
             map1 = maps.degrade_map(map1, self.new_shape)
             map2 = maps.degrade_map(map2, self.new_shape)
@@ -215,8 +237,10 @@ class power_spectrum:
 
         if implementation == "pymaster":
 
-            f1 = nmt.NmtFieldFlat(self.pix.nx*self.pix.dx,self.pix.ny*self.pix.dy,mask_np,[map1_np])
-            f2 = nmt.NmtFieldFlat(self.pix.nx*self.pix.dx,self.pix.ny*self.pix.dy,mask_np,[map2_np])
+            if f1 is None:
+                f1 = nmt.NmtFieldFlat(self.pix.nx*self.pix.dx,self.pix.ny*self.pix.dy,mask_np,[map1_np])
+            if f2 is None:
+                f2 = nmt.NmtFieldFlat(self.pix.nx*self.pix.dx,self.pix.ny*self.pix.dy,mask_np,[map2_np])
             cl00_coupled = nmt.compute_coupled_cell_flat(f1,f2,self.bins)
 
             if decouple_type == "none":
@@ -333,6 +357,16 @@ class cross_spec:
         t_map_np = np.asarray(t_map)
         t_map_2_np = np.asarray(t_map_2)
 
+        if implementation == "pymaster":
+
+            fields_1 = [ps.get_nmt_field(t_map_np[:,:,k]) for k in range(0,n_freq)]
+            fields_2 = fields_1 if t_map_2 is t_map else \
+            [ps.get_nmt_field(t_map_2_np[:,:,k]) for k in range(0,n_freq)]
+
+        else:
+
+            fields_1 = fields_2 = [None]*n_freq
+
         for i in range(0,n_freq):
 
             for j in range(0,n_freq):
@@ -341,7 +375,7 @@ class cross_spec:
 
                     ell,cl = ps.get_power_spectrum(t_map_np[:,:,i],
                     map2=t_map_2_np[:,:,j],decouple_type=decouple_type,
-                    implementation=implementation)
+                    implementation=implementation,f1=fields_1[i],f2=fields_2[j])
                     if inpaint_flag == True:
 
                         ell,cl = correct_for_inpainting((ell,cl),np.asarray(mask_point),lsep=lsep)

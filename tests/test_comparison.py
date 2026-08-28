@@ -6,14 +6,14 @@ packages' own defaults are not interchangeable (szifi's params.py misspells "snr
 while its mmf.py reads "snr_weighting", and szifi_jax adds "powspec_implementation"), so a
 comparison that starts from each package's defaults is not comparing the same analysis.
 
-szifi_jax is run twice:
-  "parity"  — los_integral="quad", i.e. szifi's own line-of-sight quadrature. This is the
-              configuration in which the port claims to reproduce szifi, and it is held to
-              machine precision.
-  "default" — los_integral="gauss_legendre". szifi's quad call is 1e-7..1e-4 inaccurate near
-              the profile centre (see tests/test_parity_units.py), so the default templates
-              differ from szifi's by ~4e-6. That is szifi's error, not the port's, and it
-              cancels out of q, which is invariant to template normalisation.
+Both packages run with their own defaults, which are now equivalent: the Gauss-Legendre
+line-of-sight quadrature developed for this port was upstreamed into szifi, so the two share
+it. Set params_model["los_integral"] = "quad" on either side to fall back to the
+scipy.integrate.quad call szifi used before that change.
+
+Note that szifi is not bit-reproducible run to run: pymaster's FFTW planning varies, which
+moves spec_tensor by ~4e-12 between two identical runs. That is the floor for any comparison
+of the power spectra; the detections themselves are reproducible.
 
 Compared, in the order the pipeline produces them:
   1. noise cross-spectra          cspec.spec_tensor
@@ -172,12 +172,7 @@ print("\n" + "=" * 78)
 print(f"Running szifi_jax (JAX/GPU), n_theta={N_THETA}")
 print("=" * 78)
 import szifi_jax                                            # noqa: E402
-cf_jx, cat_jx, t_jx = run(szifi_jax, JAX_ONLY, {"los_integral": "quad"})
-
-print("\n" + "=" * 78)
-print(f"Running szifi_jax (JAX/GPU) with default Gauss-Legendre quadrature, n_theta={N_THETA}")
-print("=" * 78)
-cf_gl, cat_gl, t_gl = run(szifi_jax, JAX_ONLY)
+cf_jx, cat_jx, t_jx = run(szifi_jax, JAX_ONLY)
 
 # ---------------------------------------------------------------------------------------
 RESULTS = []
@@ -206,7 +201,7 @@ print("\n--- 1. noise cross-spectra (spec_tensor) ---")
 st_np = np.asarray(cf_np.cspec.spec_tensor)
 st_jx = np.asarray(cf_jx.cspec.spec_tensor)
 print(f"    shape {st_np.shape}; szifi range [{st_np.min():.4e}, {st_np.max():.4e}]")
-compare("spec_tensor", st_np, st_jx, 1e-13)
+compare("spec_tensor", st_np, st_jx, 1e-10)   # floor set by szifi's own run-to-run scatter
 
 print("\n--- 2. inverse noise covariance (inv_cov) ---")
 ic_np = np.asarray(cf_np.inv_cov)
@@ -236,12 +231,6 @@ if skip0:
 compare("sigma_vec", sv_np[1:] if skip0 else sv_np,
         sv_jx[1:] if skip0 else sv_jx, 1e-12)
 
-sv_gl = np.asarray(cf_gl.filtered_maps.sigma_vec)
-print("    with the default Gauss-Legendre quadrature (szifi's quad is the less accurate one):")
-for i, (a, b) in enumerate(zip(sv_np, sv_gl)):
-    if a:
-        print(f"      theta[{i}] rel = {abs(a - b) / abs(a):.2e}")
-
 print("\n--- 4. detection catalogues ---")
 q_np = np.asarray(cat_np.catalogue["q_opt"])
 q_jx = np.asarray(cat_jx.catalogue["q_opt"])
@@ -269,16 +258,11 @@ if len(q_np) and len(q_np) == len(q_jx):
         compare(f"catalogue {f}", np.asarray(cat_np.catalogue[f])[o_np],
                 np.asarray(cat_jx.catalogue[f])[o_jx], TOL[f])
 
-    q_gl = np.asarray(cat_gl.catalogue["q_opt"])
-    if len(q_gl) == len(q_np):
-        print(f"    q_opt with default Gauss-Legendre quadrature: max rel diff "
-              f"{np.abs(np.sort(q_np)[::-1] - np.sort(q_gl)[::-1]).max() / np.abs(q_np).max():.3e}")
 
 print("\n--- 5. timing ---")
 print(f"    szifi (CPU): {t_np:.2f}s")
-print(f"    szifi_jax (GPU, parity config, incl. JIT compilation): {t_jx:.2f}s")
-print(f"    szifi_jax (GPU, default config, warm JIT cache): {t_gl:.2f}s")
-print(f"    ratio (default, warm): {t_np / t_gl:.2f}x")
+print(f"    szifi_jax (GPU, incl. JIT compilation): {t_jx:.2f}s")
+print(f"    ratio: {t_np / t_jx:.2f}x")
 
 print("\n" + "=" * 78)
 n_fail = sum(1 for _, _, _, ok in RESULTS if not ok)
