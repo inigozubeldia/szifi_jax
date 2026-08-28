@@ -313,9 +313,16 @@ Not yet exercised by any test:
 1. Extend `tests/test_comparison.py` to CAR tiles and a multi-field run.
 2. Exercise the spectrally-constrained MMF and `max_it > 1`; give `utils.invert_cov` the same
    backend switch as `spec.get_inv_cov`.
-3. Validate `powspec_implementation="custom"` against the pymaster/MASTER path. This is the
-   only remaining large lever, and only for runs that cannot reuse a coupling matrix; note it
-   does not implement MASTER decoupling, so it is a different estimator, not a drop-in.
+3. Decide what to do about the mode-coupling matrix, the one remaining large cost (~139 s per
+   tile, 97% of a cold run). Two options, neither finished:
+   * `powspec_implementation="custom"`, the all-JAX estimator already in `spec.py`. Avoids
+     NaMaster entirely but does **not** implement MASTER decoupling, so it is a different
+     estimator, not a drop-in. Unvalidated.
+   * `notes/mode_coupling_fft_prototype.py`, a GPU implementation of the *same* MASTER
+     matrix via FFTs. The formula is verified exact against pymaster (3.4e-15 by brute force
+     on a small grid) and runs in **0.36 s against pymaster's 138.8 s** at full size, but
+     currently agrees only to ~6e-7, with one bin at 1.5e-4. Three candidate causes have been
+     tested and rejected; see the module docstring. Needs ~1e-12 before it can be used.
 4. Port `reshape_ell_matrix` and `resample_fft` to JAX and lift the `inv_cov` shape
    restriction on the batched MMF.
 5. Move noise generation to `jax.random` so simulations are reproducible and jittable.
