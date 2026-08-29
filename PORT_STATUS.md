@@ -396,8 +396,16 @@ the MMF `scan` over θ and 3D peak-find scale with n_θ; spectra, unique-bin
 inv, and inpaint do not. Predicted **2–2.5×**. Measured on L1_m9, 16 tiles,
 warm: **3.6 s → 8.1 s (2.25×)**, 0.22 → 0.51 s/tile.
 
-Four L1 feedback prescriptions (L1_m9, fgas-8σ, M\*-1σ, LS8) were not
-finished in this session (batch-size retune aborted the full-sky jobs).
+**L1 feedback prescriptions** (same 8-scale CNC path, `gpu_tile_batch=16`).
+Jax catalogues vs NumPy `fullsky_splitA_immf_q5.npz`; every position matched
+(median sep 0), N(q) bins identical:
+
+| prescription | N | max \|Δq\| | wall |
+|---|---|---|---|
+| L1_m9 | **2509/2509** | 3.1e-5 | 6.5 min |
+| fgas−8σ | **2125/2125** | 2.8e-5 | 8.9 min |
+| M\*−1σ | **2634/2634** | 4.9e-3 (one cluster) | 9.9 min |
+| LS8 | **1561/1561** | 2.8e-5 | 9.0 min |
 
 ## 11. Suggested next steps
 
