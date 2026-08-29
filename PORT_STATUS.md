@@ -350,9 +350,42 @@ Not yet exercised by any test:
 * The iterative noise path with `max_it > 1`.
 * `powspec_lmax1d` / `powspec_new_shape`, including the sequential fallback they now trigger.
 * `cov_type` other than `"isotropic"`.
-* `powspec_implementation="custom"` against `"pymaster"`.
+* `powspec_implementation="custom"` against `"pymaster"` on MASTER. On FLAMINGO homog **fsky**
+  it was measured and **fails** (`spec_tensor` rel ~100, thousands of spurious detections).
 
-## 10. Suggested next steps
+## 10. This machine (2026-08-29)
+
+GPU1 = RTX PRO 6000 Blackwell (sm_120), JAX 0.10. `tests/test_parity_units.py` 20/20.
+
+**Batched MMF.** `vmap` over `theta_500` of the per-mode 6×6 einsum dies with
+`JaxRuntimeError INTERNAL`. Not memory: `n_theta=1` at 1024² works; `n_theta=2` fails from
+`nx≥256` or `n_freq≥2`; FFTs vmap. The kernel now flattens to a 3D gemv
+`(n_theta·n_pix, n_freq)` × `(n_theta·n_pix, n_freq, n_freq)` and batches FFTs with frequency
+on a leading axis. Same contraction, supported on this GPU.
+
+**FLAMINGO homog iMMF** (fsky, Gaussian beam, 8 scales, unmasked tiles): tiles 0–1 match the
+NumPy catalogue **10/10**, median separation **0.0 arcmin**.
+
+**GPU tile batch.** Sequential tiles were ~3.8 s/tile (NaMaster + LAPACK). The hot
+path now stacks many tiles:
+
+* `powspec_implementation="nmt_jax"` — coupled cells matching
+  `nmt.compute_coupled_cell_flat` (rfft visit, ~1e-16 on Cl > 1e-20). 8 tiles in 43 ms
+  after compile. The old `"custom"` periodogram is still not a drop-in (median Cl rel
+  ~0.25).
+* `gpu_tile_batch` (default 16) — spec for all tiles in one launch; MMF FFTs
+  every tile at once and scans only over `theta_500` (a 12 GB `(θ,T,ν)` buffer
+  OOM'd). Templates are cached across runner batches.
+* **CNC / catalogue path** (must match the NumPy catalogue): unique 6×6
+  spectra inverted with LAPACK then scattered on GPU
+  (`invert_spec_interp_tiles`; nearest-neighbour, same as per-mode inv).
+  Do **not** invert the 1024² grid with `jnp.linalg.inv` (moves `q_opt` at
+  ~3e-3 on singular modes) or use Jacobi inpaint. it1 is raster
+  Gauss-Seidel (threaded over tiles) + one stacked GPU FFT. Tiles 0–1:
+  **10/10**, median sep **0.0 arcmin**, max |Δq| **6e-6**. Warm 16 tiles
+  **8.0 s (0.50 s/tile)**.
+
+## 11. Suggested next steps
 
 1. Extend `tests/test_comparison.py` to CAR tiles and a multi-field run.
 2. Exercise the spectrally-constrained MMF and `max_it > 1`; give `utils.invert_cov` the same
@@ -360,7 +393,7 @@ Not yet exercised by any test:
 3. Decide whether `coupling_matrix_backend="jax"` should become the default. It is 43x faster
    end to end and costs 2.4e-7 in `q_opt`, but it is not bit-compatible with NaMaster, and the
    reason is a suspected asymmetry in NaMaster itself that would be worth raising upstream
-   before relying on it. Validating `powspec_implementation="custom"` is the other open lever.
+   before relying on it. For **fsky**, use `nmt_jax` rather than `"custom"`.
 4. Port `reshape_ell_matrix` and `resample_fft` to JAX and lift the `inv_cov` shape
    restriction on the batched MMF.
 5. Move noise generation to `jax.random` so simulations are reproducible and jittable.

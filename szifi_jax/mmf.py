@@ -7,6 +7,8 @@ warnings.filterwarnings("ignore")
 import gzip
 import functools
 
+_TEMPLATE_CACHE = {}
+
 #Core class for cluster finding
 class cluster_finder:
 
@@ -65,7 +67,15 @@ class cluster_finder:
 
         self.results_dict = {}
 
-        for field_id in self.data_file["params_data"]["field_ids"]:
+        field_ids = list(self.data_file["params_data"]["field_ids"])
+        gpu_n = int(self.params_szifi.get("gpu_tile_batch") or 1)
+        if gpu_n > 1 and self._gpu_tile_batch_ok():
+            print("GPU tile batch:", gpu_n)
+            for start in range(0, len(field_ids), gpu_n):
+                self._find_clusters_gpu_chunk(field_ids[start:start + gpu_n])
+            return
+
+        for field_id in field_ids:
 
             print("")
             print("")
@@ -135,9 +145,10 @@ class cluster_finder:
                 self.t_true = utils.extract(self.data_file,"t_true",field_id,map_dtype)
                 self.t_true = maps.select_freqs(self.t_true,self.params_szifi["freqs"])
 
-            #Inpaint point sources
+            #Inpaint point sources. All-ones masks (e.g. unmasked homog tiles) are a
+            #no-op; skip rather than sweeping 6 channels and re-filtering.
 
-            if self.params_szifi["inpaint"] == True:
+            if self.params_szifi["inpaint"] == True and maps.mask_has_holes(self.mask_point):
 
                 self.t_obs = maps.inpaint_freq(self.t_obs,
                                                self.mask_point,
@@ -240,7 +251,7 @@ class cluster_finder:
 
                 #Inpaint noise map (as it may change with iteration)
 
-                if self.params_szifi["inpaint"] == True:
+                if self.params_szifi["inpaint"] == True and maps.mask_has_holes(self.mask_point):
 
                     self.t_noi = maps.inpaint_freq(t_noi_original,
                                                    self.mask_point,
@@ -513,6 +524,304 @@ class cluster_finder:
 
             self.results_dict[field_id] = self.results
 
+    def _gpu_tile_batch_ok(self):
+        p = self.params_szifi
+        return (
+            p["mmf_type"] == "standard"
+            and p["decouple_type"] == "fsky"
+            and p["cov_type"] == "isotropic"
+            and p["extraction_mode"] == "find"
+            and p["tile_type"] == "healpix"
+            and not p["get_q_true"]
+            and not p["snr_weighting"]
+            and p.get("powspec_new_shape") is None
+            and p.get("powspec_lmax1d") is None
+        )
+
+    def _ensure_standard_templates(self, pix, filter_mask):
+        n_theta = len(self.theta_500_vec)
+        key = (pix.nx, pix.ny, float(pix.dx), float(pix.dy), n_theta,
+               self.params_szifi["beam"], self.params_model["los_integral"],
+               self.params_szifi["norm_type"], tuple(self.params_szifi["lrange"]),
+               tuple(self.theta_500_vec))
+        global _TEMPLATE_CACHE
+        if key in _TEMPLATE_CACHE:
+            self._template_cache = _TEMPLATE_CACHE[key]
+            return self._template_cache
+        cache = getattr(self, "_template_cache", {})
+        if all(j in cache for j in range(n_theta)):
+            _TEMPLATE_CACHE[key] = cache
+            self._template_cache = cache
+            return cache
+        for j in range(n_theta):
+            if j in cache:
+                continue
+            if self.rank == 0:
+                print("Theta", j, self.theta_500_vec[j])
+            z = 0.2
+            M_500 = model.get_m_500(self.theta_500_vec[j], z, self.cosmology)
+            nfw = model.gnfw(M_500, z, self.cosmology,
+                             type=self.params_model["profile_type"],
+                             los_integral=self.params_model["los_integral"])
+            theta_cart = [(0.5 * pix.nx) * pix.dx, (0.5 * pix.nx) * pix.dx]
+            t_tem = nfw.get_t_map_convolved(
+                pix, self.exp, beam=self.params_szifi["beam"],
+                theta_cart=theta_cart, get_nc=False, sed=False,
+                tile_type=self.params_szifi["tile_type"], wcs=None)
+            t_tem = t_tem / nfw.get_y_norm(self.params_szifi["norm_type"])
+            tem = maps.filter_tmap(t_tem, pix, self.params_szifi["lrange"],
+                                   filter_mask=filter_mask)
+            cache[j] = (tem, None)
+        _TEMPLATE_CACHE[key] = cache
+        self._template_cache = cache
+        return cache
+
+    def _setup_one_tile(self, field_id):
+        map_dtype = self.params_szifi["map_dtype"]
+        t_obs = maps.select_freqs(self.data_file["t_obs"][field_id],
+                                  self.params_szifi["freqs"])
+        t_noi = maps.select_freqs(self.data_file["t_noi"][field_id],
+                                  self.params_szifi["freqs"])
+        mask_point = utils.extract(self.data_file, "mask_point", field_id, map_dtype)
+        mask_select = utils.extract(self.data_file, "mask_select", field_id, map_dtype)
+        mask_select_no_tile = utils.extract(self.data_file, "mask_select_no_tile",
+                                             field_id, map_dtype)
+        mask_select_buffer = utils.extract(self.data_file, "mask_select_buffer",
+                                            field_id, map_dtype)
+        mask_map = utils.extract(self.data_file, "mask_map", field_id, map_dtype)
+        mask_ps = utils.extract(self.data_file, "mask_ps", field_id, map_dtype)
+        mask_peak_finding_no_tile = utils.extract(
+            self.data_file, "mask_peak_finding_no_tile", field_id, map_dtype)
+        mask_peak_finding = utils.extract(
+            self.data_file, "mask_peak_finding", field_id, map_dtype)
+        dx = self.data_file["dx_arcmin"][field_id] / 60. / 180. * np.pi
+        nx = self.data_file["nx"][field_id]
+        dy = dx
+        ny = nx
+        if "dy_arcmin" in self.data_file:
+            dy = self.data_file["dy_arcmin"][field_id] / 60. / 180. * np.pi
+        if "ny" in self.data_file:
+            ny = self.data_file["ny"][field_id]
+        pix = maps.pixel(nx, dx, ny=ny, dy=dy)
+
+        if self.params_szifi["inpaint"] and maps.mask_has_holes(mask_point):
+            t_obs = maps.inpaint_freq(
+                t_obs, mask_point, n_inpaint=self.params_szifi["n_inpaint"],
+                pix=pix, noise=self.exp.noise_levels,
+                inpaint_type=self.params_szifi["inpaint_type"])
+
+        results = cat.results_detection()
+        results.info = self.params_szifi
+        results.theta_500_vec = self.theta_500_vec
+        results.fsky = np.sum(np.asarray(mask_select)) * pix.dx * pix.dy / (4. * np.pi)
+
+        if self.params_szifi["apod_type"] == "new":
+            t_obs = maps.multiply_t(mask_map, t_obs)
+
+        # Harmonic-space cut is applied once on the stacked batch in
+        # _find_clusters_gpu_chunk (16 sequential 1024² FFTs was the old setup cost).
+        ell_map = np.asarray(maps.rmap(pix).get_ell())
+        lmin, lmax = self.params_szifi["lrange"]
+        filter_mask = jnp.array((ell_map >= lmin) & (ell_map <= lmax), dtype=jnp.float64)
+        return {
+            "field_id": field_id, "pix": pix, "t_obs": t_obs, "t_noi": t_noi,
+            "t_noi_original": None, "mask_point0": mask_point,
+            "mask_cluster": np.ones((pix.nx, pix.ny), dtype=np.asarray(t_obs).dtype),
+            "mask_select": mask_select, "mask_select_no_tile": mask_select_no_tile,
+            "mask_select_buffer": mask_select_buffer, "mask_map": mask_map,
+            "mask_ps": mask_ps, "mask_peak_finding": mask_peak_finding,
+            "mask_peak_finding_no_tile": mask_peak_finding_no_tile,
+            "filter_mask": filter_mask, "ell_map": ell_map, "results": results,
+            "clusters_masked_old": cat.cluster_catalogue(),
+        }
+
+    def _find_clusters_gpu_chunk(self, field_ids):
+        """fsky iMMF for many tiles: one GPU launch per noise iteration."""
+        tiles = [self._setup_one_tile(fid) for fid in field_ids]
+        pix = tiles[0]["pix"]
+        filter_mask = tiles[0]["filter_mask"]
+        t_obs = maps.filter_tmaps(
+            jnp.stack([jnp.asarray(t["t_obs"]) for t in tiles]), pix, filter_mask)
+        t_noi = maps.filter_tmaps(
+            jnp.stack([jnp.asarray(t["t_noi"]) for t in tiles]), pix, filter_mask)
+        for k, tile in enumerate(tiles):
+            tile["t_obs"] = t_obs[k]
+            tile["t_noi"] = t_noi[k]
+            tile["t_noi_original"] = t_noi[k]
+        cache = self._ensure_standard_templates(pix, filter_mask)
+        tem_list = [cache[j][0] for j in range(len(self.theta_500_vec))]
+        a_vec = jnp.asarray(self.params_szifi["a_matrix"][:, 0])
+        bin_fac = self.params_szifi["powspec_bin_fac"]
+        l0_bins = np.arange(pix.nx / bin_fac) * bin_fac * np.pi / (pix.nx * pix.dx)
+        lf_bins = (np.arange(pix.nx / bin_fac) + 1) * bin_fac * np.pi / (pix.nx * pix.dx)
+        ell_eff = 0.5 * (l0_bins + lf_bins)
+        ell_map = tiles[0]["ell_map"]
+        max_it = self.params_szifi["max_it"] if self.params_szifi["iterative"] else 0
+        tilemask_mode = self.params_szifi["tilemask_mode"]
+
+        dummy_inv = jnp.zeros((pix.nx, pix.ny, len(self.params_szifi["freqs"]),
+                               len(self.params_szifi["freqs"])))
+        cmmf = scmmf_precomputation(
+            pix=pix, freqs=self.params_szifi["freqs"], inv_cov=dummy_inv,
+            lrange=self.params_szifi["lrange"], beam_type=self.params_szifi["beam"],
+            exp=self.exp, cmmf_type="standard_mmf",
+            a_matrix=self.params_szifi["a_matrix"], mmf_type="standard")
+
+        i = 0
+        active = tiles
+        while i >= 0:
+            if self.rank == 0:
+                print("Noise it", i, "tiles", active[0]["field_id"], "..",
+                      active[-1]["field_id"], "n=", len(active))
+            t_noi = jnp.stack([jnp.asarray(t["t_noi"]) for t in active])
+            if self.params_szifi["apod_type"] == "old":
+                t_obs = jnp.stack([
+                    maps.multiply_t(t["mask_map"], t["t_obs"]) for t in active])
+                t_obs = maps.filter_tmaps(t_obs, pix, filter_mask)
+            else:
+                t_obs = jnp.stack([jnp.asarray(t["t_obs"]) for t in active])
+            masks_ps = jnp.stack([jnp.asarray(t["mask_ps"]) for t in active])
+            mask_point = jnp.stack([
+                jnp.asarray(t["mask_point0"]) * jnp.asarray(t["mask_cluster"])
+                for t in active])
+
+            spec_full = spec.coupled_cells_nmt(t_noi, pix, l0_bins, lf_bins,
+                                               masks=masks_ps)
+            ell_vec, spec_tensor = spec.apply_fsky_inpaint_drop_first(
+                spec_full, ell_eff, np.asarray(masks_ps), np.asarray(mask_point),
+                "fsky", self.params_szifi["inpaint"], self.params_szifi["lsep"])
+            del spec_full
+            inv = spec.invert_spec_interp_tiles(
+                ell_map, ell_vec, spec_tensor,
+                backend=self.params_szifi.get("inv_cov_backend", "numpy"))
+            q_all, y_all, stds_all = get_mmf_q_maps_tiles(
+                t_obs, tem_list, inv, pix, a_vec)
+
+            next_active = []
+            for k, tile in enumerate(active):
+                field_id = tile["field_id"]
+                if tilemask_mode == "catalogue":
+                    mask_peak_finding_dict = {
+                        "field": tile["mask_peak_finding_no_tile"],
+                        "names": ["field"]}
+                    mask_select_dict = {
+                        "field": tile["mask_select_no_tile"],
+                        "tile": tile["mask_select"],
+                        "names": {"field": ["field", "tile"]}}
+                    catalogue_find_key = ("field", "tile")
+                    catalogue_buffer_key = "empty"
+                    for_masking_key = ("field", "field")
+                elif tilemask_mode == "catalogue_buffer":
+                    mask_peak_finding_dict = {
+                        "field": tile["mask_peak_finding_no_tile"],
+                        "names": ["field"]}
+                    mask_select_dict = {
+                        "field": tile["mask_select_no_tile"],
+                        "tile": tile["mask_select"],
+                        "buffer": tile["mask_select_buffer"],
+                        "names": {"field": ["field", "tile", "buffer"]}}
+                    catalogue_find_key = ("field", "tile")
+                    catalogue_buffer_key = ("field", "buffer")
+                    for_masking_key = ("field", "field")
+                else:
+                    mask_peak_finding_dict = {
+                        "field": tile["mask_peak_finding_no_tile"],
+                        "tile": tile["mask_peak_finding"],
+                        "names": ["field", "tile"]}
+                    mask_select_dict = {
+                        "field": tile["mask_select_no_tile"],
+                        "tile": tile["mask_select"],
+                        "names": {"field": ["field"], "tile": ["tile"]}}
+                    catalogue_find_key = ("tile", "tile")
+                    catalogue_buffer_key = "empty"
+                    for_masking_key = ("field", "field")
+
+                fm = filter_maps(
+                    t_obs=tile["t_obs"], inv_cov=inv[k], pix=pix,
+                    cosmology=self.cosmology, theta_500_vec=self.theta_500_vec,
+                    params=self.params_szifi, params_model=self.params_model,
+                    field_id=field_id, i_it=i, mask_map=tile["mask_map"],
+                    mask_select_dict=mask_select_dict,
+                    mask_peak_finding_dict=mask_peak_finding_dict,
+                    rank=self.rank, exp=self.exp, cmmf=cmmf,
+                    filter_mask=filter_mask)
+                fm._template_cache = cache
+                fm._precomputed_q = (q_all[k], y_all[k], stds_all[k])
+                fm.find_clusters()
+                tile["results"].sigma_vec["find_" + str(i)] = fm.sigma_vec
+                tile["results"].catalogues["catalogue_find_" + str(i)] = (
+                    fm.results[catalogue_find_key])
+                tile["results"].catalogues["catalogue_find_buffer_" + str(i)] = (
+                    fm.results[catalogue_buffer_key])
+                results_for_masking = fm.results[for_masking_key]
+                n_clusters = (
+                    len(tile["results"].catalogues["catalogue_find_" + str(i)].catalogue["q_opt"])
+                    + len(tile["results"].catalogues["catalogue_find_buffer_" + str(i)].catalogue["q_opt"]))
+                if self.rank == 0:
+                    qdet = tile["results"].catalogues["catalogue_find_" + str(i)].catalogue["q_opt"]
+                    n_q = len(qdet)
+                    qmax = float(np.max(qdet)) if n_q else 0.0
+                    print(f"  field {field_id}  n={n_q} qmax={qmax:.2f}")
+
+                if (not self.params_szifi["iterative"]) or i == max_it or n_clusters == 0:
+                    continue
+
+                clusters_masked_new = cat.apply_q_cut(
+                    results_for_masking, self.params_szifi["q_th_noise"])
+                if len(clusters_masked_new.catalogue["q_opt"]) == 0:
+                    continue
+                tile["mask_cluster"] = get_cluster_mask(
+                    pix, results_for_masking, self.params_szifi["q_th_noise"],
+                    self.params_szifi["mask_radius"],
+                    tile_type=self.params_szifi["tile_type"],
+                    max_masking_radius_arcmin=self.params_szifi["max_radius_mask_arcmin"],
+                    min_masking_radius_arcmin=self.params_szifi["min_radius_mask_arcmin"])
+                mp = np.asarray(tile["mask_point0"]) * tile["mask_cluster"]
+                tile["_mp_it1"] = mp
+                next_active.append(tile)
+
+            if next_active and self.params_szifi["inpaint"]:
+                # Exact Gauss-Seidel (szifi), not Jacobi. Tiles are independent, so
+                # thread the GS sweeps and cosine blends, then one stacked FFT.
+                from concurrent.futures import ThreadPoolExecutor
+                hole = []
+                for tile in next_active:
+                    if maps.mask_has_holes(tile["_mp_it1"]):
+                        hole.append(tile)
+                    else:
+                        tile["t_noi"] = tile["t_noi_original"]
+                if hole:
+                    t_gs = maps.inpaint_freq_tiles_gs(
+                        [t["t_noi_original"] for t in hole],
+                        [t["_mp_it1"] for t in hole],
+                        n_inpaint=self.params_szifi["n_inpaint"])
+
+                    def _blend(k):
+                        return np.asarray(maps.circular_cosine_blend_adaptive_multi(
+                            hole[k]["t_noi_original"], t_gs[k],
+                            hole[k]["_mp_it1"], inner_zero_frac=0.))
+
+                    with ThreadPoolExecutor(max_workers=min(len(hole), 16)) as ex:
+                        blended = list(ex.map(_blend, range(len(hole))))
+                    t_filt = maps.filter_tmaps(jnp.stack(blended), pix, filter_mask)
+                    for k, tile in enumerate(hole):
+                        tile["t_noi"] = t_filt[k]
+            elif next_active:
+                for tile in next_active:
+                    tile["t_noi"] = tile["t_noi_original"]
+
+            if (not self.params_szifi["iterative"]) or i == max_it or not next_active:
+                break
+            active = next_active
+            i += 1
+
+
+        for tile in tiles:
+            field_id = tile["field_id"]
+            if self.params_szifi["get_lonlat"]:
+                tile["results"].get_lonlat(
+                    field_id, pix, nside=self.data_file["nside_tile"])
+            self.results_dict[field_id] = tile["results"]
 
 
 #Get mask at the location of detected clusters (for iterative noise covariance estimation)
@@ -671,9 +980,10 @@ class filter_maps:
                      and inv_cov_full_shape
                      and not self.params["snr_weighting"]
                      and not self.params["save_snr_maps"])
+        precomputed_q = getattr(self, "_precomputed_q", None)
 
         # If templates not yet cached but batch is possible, compute all templates first
-        if not all_cached and can_batch:
+        if precomputed_q is None and not all_cached and can_batch:
             for j in range(n_theta):
                 if j in _cache:
                     continue
@@ -733,16 +1043,20 @@ class filter_maps:
 
             all_cached = True
 
-        use_batch = (all_cached and can_batch
-                     and all(_cache[j][1] is None for j in range(n_theta)))
+        use_batch = (precomputed_q is not None) or (
+            all_cached and can_batch
+            and all(_cache[j][1] is None for j in range(n_theta)))
 
         if use_batch:
-            # BATCHED PATH: compute all q_maps in a single GPU call
-            tem_list = [_cache[j][0] for j in range(n_theta)]
-            a_vec = jnp.asarray(self.cmmf.a_matrix[:, 0])
+            if precomputed_q is not None:
+                q_maps_all, y_maps_all, stds_all = precomputed_q
+            else:
+                # BATCHED PATH: compute all q_maps in a single GPU call
+                tem_list = [_cache[j][0] for j in range(n_theta)]
+                a_vec = jnp.asarray(self.cmmf.a_matrix[:, 0])
 
-            q_maps_all, y_maps_all, stds_all = get_mmf_q_maps_batch(
-                t_obs, tem_list, self.inv_cov, self.pix, a_vec)
+                q_maps_all, y_maps_all, stds_all = get_mmf_q_maps_batch(
+                    t_obs, tem_list, self.inv_cov, self.pix, a_vec)
 
             self.sigma_vec = np.asarray(stds_all)
 
@@ -1442,38 +1756,41 @@ def _get_mmf_q_maps_batch_jit(tmap, tem_batch, inv_cov, a_vec, dx, dy, pnx, pny)
     # convolution at the map dtype (params["map_dtype"]), so follow tmap's dtype rather than
     # forcing float32 — otherwise map_dtype=np.float64 would be silently downgraded.
     conv_dtype = tmap.dtype
-    fa_tmap = jax.vmap(lambda m: jnp.fft.fft2(m, s=(pnx, pny)), in_axes=2)(tmap)
+    n_theta = tem_batch.shape[0]
+    n_pix = nx * ny_dim
 
-    def process_one_template(tem):
-        # FFT template (same as get_fft_f) — float64 for filter precision
-        tem_fft = jax.vmap(lambda m: jnp.fft.fft2(m) * fft_norm, in_axes=2, out_axes=2)(tem)
-        # Weight by SED
-        tem_fft_a = tem_fft * a_vec[None, None, :]
-        # Filter: einsum with inv_cov
-        filter_fft = jnp.einsum('ijk,ijkl->ijl', tem_fft_a, inv_cov)
-        # NaN guard
-        filter_fft = jnp.where(jnp.isnan(filter_fft), 0., filter_fft)
-        # IFFT filter (same as get_ifft_f)
-        filter_val = jax.vmap(lambda m: jnp.fft.ifft2(m) * ifft_norm, in_axes=2, out_axes=2)(filter_fft).real
-        filter_val = filter_val.astype(tmap.dtype)
-        # Normalization in float64
-        tem_a = tem * a_vec[None, None, :]
-        norm = jnp.sum(tem_a * filter_val) * dxdy
-        # Convolution at the map dtype, matching szifi's scipy.signal.fftconvolve call
-        filter_conv = filter_val.astype(conv_dtype)
-        fb = jax.vmap(lambda m: jnp.fft.fft2(m, s=(pnx, pny)), in_axes=2)(filter_conv)
-        product_sum = jnp.sum(fa_tmap * fb, axis=0)
-        conv = jnp.fft.ifft2(product_sum).real
-        start0 = (nx - 1) // 2
-        start1 = (ny_dim - 1) // 2
-        y_map = jax.lax.dynamic_slice(conv, (start0, start1), (nx, ny_dim)).astype(jnp.float64) * dxdy
-        # Normalize
-        y_map = y_map / norm
-        std = 1. / jnp.sqrt(norm)
-        q_map = y_map / std
-        return q_map, y_map, std
+    # FFTs batch over a leading axis. Do not vmap a 5D (n_theta,nx,ny,n_freq) x
+    # (nx,ny,n_freq,n_freq) einsum: on Blackwell (sm_120, JAX 0.10) that raises
+    # JaxRuntimeError INTERNAL (not OOM — n_theta=1 works, n_theta=2 fails from
+    # nx>=256 or n_freq>=2). Flattening to a 3D batched gemv is the same math
+    # and is supported.
+    fa_tmap = jnp.fft.fft2(jnp.moveaxis(tmap, -1, 0), s=(pnx, pny))  # (n_freq, pnx, pny)
 
-    q_maps, y_maps, stds = jax.vmap(process_one_template)(tem_batch)
+    tem_f = jnp.moveaxis(tem_batch, -1, 1)  # (n_theta, n_freq, nx, ny)
+    tem_fft = jnp.fft.fft2(tem_f) * fft_norm
+    tem_fft_a = jnp.moveaxis(tem_fft * a_vec[None, :, None, None], 1, -1)  # (nt, nx, ny, nf)
+
+    a = tem_fft_a.reshape((n_theta * n_pix, n_freq))
+    inv_b = jnp.broadcast_to(inv_cov, (n_theta, nx, ny_dim, n_freq, n_freq)).reshape(
+        (n_theta * n_pix, n_freq, n_freq)
+    )
+    filter_fft = jnp.einsum("bi,bij->bj", a, inv_b).reshape((n_theta, nx, ny_dim, n_freq))
+    filter_fft = jnp.where(jnp.isnan(filter_fft), 0., filter_fft)
+
+    filter_val = jnp.fft.ifft2(jnp.moveaxis(filter_fft, -1, 1)).real * ifft_norm
+    filter_val = jnp.moveaxis(filter_val, 1, -1).astype(tmap.dtype)
+
+    tem_a = tem_batch * a_vec[None, None, None, :]
+    norm = jnp.sum(tem_a * filter_val, axis=(1, 2, 3)) * dxdy  # (n_theta,)
+
+    fb = jnp.fft.fft2(jnp.moveaxis(filter_val.astype(conv_dtype), -1, 1), s=(pnx, pny))
+    conv = jnp.fft.ifft2(jnp.sum(fa_tmap[None, :, :, :] * fb, axis=1)).real
+    start0 = (nx - 1) // 2
+    start1 = (ny_dim - 1) // 2
+    y_maps = conv[:, start0:start0 + nx, start1:start1 + ny_dim].astype(jnp.float64) * dxdy
+    y_maps = y_maps / norm[:, None, None]
+    stds = 1. / jnp.sqrt(norm)
+    q_maps = y_maps / stds[:, None, None]
     return q_maps, y_maps, stds
 
 
@@ -1496,6 +1813,76 @@ def get_mmf_q_maps_batch(tmap, tem_list, inv_cov, pix, a_vec):
     return _get_mmf_q_maps_batch_jit(
         jnp.asarray(tmap), tem_batch, inv_cov, a_vec,
         jnp.float64(pix.dx), jnp.float64(pix.dy), pnx, pny)
+
+
+def get_mmf_q_maps_tiles(tmaps, tem_list, inv_covs, pix, a_vec):
+    """Matched filter for a stack of tiles, templates shared.
+
+    tmaps: (n_tile, nx, ny, n_freq)
+    tem_list: list of (nx, ny, n_freq)
+    inv_covs: (n_tile, nx, ny, n_freq, n_freq)
+    Returns q (n_tile, n_theta, nx, ny), y, stds (n_tile, n_theta)
+
+    FFTs and the 6×6 gemv run over all tiles at once. Theta is scanned so we
+    never broadcast inv_cov over theta (that 5D einsum crashes on Blackwell).
+    """
+    tem_batch = jnp.stack(tem_list, axis=0)
+    nx, ny = pix.nx, pix.ny
+    pnx = utils._next_fast_fft_len(2 * nx - 1)
+    pny = utils._next_fast_fft_len(2 * ny - 1)
+    q, y, stds = _get_mmf_q_maps_tiles_jit(
+        jnp.asarray(tmaps), tem_batch, jnp.asarray(inv_covs), a_vec,
+        jnp.float64(pix.dx), jnp.float64(pix.dy), pnx, pny)
+    return q, y, stds
+
+
+@functools.partial(jax.jit, static_argnums=(6, 7))
+def _get_mmf_q_maps_tiles_jit(tmaps, tem_batch, inv_covs, a_vec, dx, dy, pnx, pny):
+    """Tile-parallel MMF. tmaps (T, nx, ny, nf), tem (n_theta, nx, ny, nf).
+
+    Scan over theta so we never materialise (n_theta, T, nf, nx, ny) complex
+    (that was 12 GB at T=16 and OOM'd). Each step still FFTs every tile at once.
+    """
+    n_tile, nx, ny_dim, n_freq = tmaps.shape
+    n_pix = nx * ny_dim
+    fft_norm = jnp.sqrt((dx * dy) / (nx * ny_dim))
+    ifft_norm = jnp.sqrt((nx * ny_dim) / (dx * dy))
+    dxdy = dx * dy
+    conv_dtype = tmaps.dtype
+    start0 = (nx - 1) // 2
+    start1 = (ny_dim - 1) // 2
+
+    fa_tmap = jnp.fft.fft2(jnp.moveaxis(tmaps, -1, 1), s=(pnx, pny))
+
+    tem_f = jnp.moveaxis(tem_batch, -1, 1)
+    tem_fft = jnp.fft.fft2(tem_f) * fft_norm
+    tem_fft_a = jnp.moveaxis(tem_fft * a_vec[None, :, None, None], 1, -1)
+    tem_a = tem_batch * a_vec[None, None, None, :]
+
+    inv_b = inv_covs.reshape((n_tile * n_pix, n_freq, n_freq))
+
+    def one_theta(tem_a_fft, tem_a_map):
+        a = jnp.broadcast_to(tem_a_fft, (n_tile, nx, ny_dim, n_freq)).reshape(
+            (n_tile * n_pix, n_freq))
+        filt = jnp.einsum("bi,bij->bj", a, inv_b).reshape(
+            (n_tile, nx, ny_dim, n_freq))
+        filt = jnp.where(jnp.isnan(filt), 0., filt)
+        filter_val = jnp.fft.ifft2(jnp.moveaxis(filt, -1, 1)).real * ifft_norm
+        filter_val = jnp.moveaxis(filter_val, 1, -1).astype(tmaps.dtype)
+        norm = jnp.sum(tem_a_map[None] * filter_val, axis=(1, 2, 3)) * dxdy
+        fb = jnp.fft.fft2(jnp.moveaxis(filter_val.astype(conv_dtype), -1, 1), s=(pnx, pny))
+        conv = jnp.fft.ifft2(jnp.sum(fa_tmap * fb, axis=1)).real
+        y = conv[:, start0:start0 + nx, start1:start1 + ny_dim].astype(jnp.float64) * dxdy
+        y = y / norm[:, None, None]
+        std = 1. / jnp.sqrt(norm)
+        q = y / std[:, None, None]
+        return q, y, std
+
+    def step(_, inputs):
+        return None, one_theta(*inputs)
+
+    q, y, stds = jax.lax.scan(step, None, (tem_fft_a, tem_a))[1]
+    return jnp.swapaxes(q, 0, 1), jnp.swapaxes(y, 0, 1), jnp.swapaxes(stds, 0, 1)
 
 
 def get_tem_conv_fft(pix_tem,tem_fft,inv_cov,mmf_type="standard",cmmf_prec=None,comp=0):
