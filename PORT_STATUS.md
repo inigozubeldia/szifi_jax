@@ -361,29 +361,43 @@ GPU1 = RTX PRO 6000 Blackwell (sm_120), JAX 0.10. `tests/test_parity_units.py` 2
 `JaxRuntimeError INTERNAL`. Not memory: `n_theta=1` at 1024² works; `n_theta=2` fails from
 `nx≥256` or `n_freq≥2`; FFTs vmap. The kernel now flattens to a 3D gemv
 `(n_theta·n_pix, n_freq)` × `(n_theta·n_pix, n_freq, n_freq)` and batches FFTs with frequency
-on a leading axis. Same contraction, supported on this GPU.
+on a leading axis. Same contraction, supported on this GPU. Theta is still a
+`lax.scan` (cannot vmap that contraction here).
 
-**FLAMINGO homog iMMF** (fsky, Gaussian beam, 8 scales, unmasked tiles): tiles 0–1 match the
-NumPy catalogue **10/10**, median separation **0.0 arcmin**.
+**FLAMINGO homog iMMF** (fsky, Gaussian beam, 8 scales 1′–10′, unmasked 768 tiles).
+CNC path: `nmt_jax` + unique-bin LAPACK then GPU scatter
+(`invert_spec_interp_tiles`) + raster Gauss-Seidel (not Jacobi) + stacked GPU
+FFT. Do **not** invert the 1024² grid with `jnp.linalg.inv` (moves `q_opt` at
+~3e-3 on singular modes) or use Jacobi inpaint.
 
-**GPU tile batch.** Sequential tiles were ~3.8 s/tile (NaMaster + LAPACK). The hot
-path now stacks many tiles:
+| check | result |
+|---|---|
+| tiles 0–1 | **10/10**, median sep **0**, max \|Δq\| **6e-6** |
+| full sky | **N=2364/2364**, all positions matched, median sep **0**, N(q) bins identical |
+| max \|Δq\| | **1.0e-3** on one cluster (tile 190); the rest ≲ 4e-5 |
 
-* `powspec_implementation="nmt_jax"` — coupled cells matching
-  `nmt.compute_coupled_cell_flat` (rfft visit, ~1e-16 on Cl > 1e-20). 8 tiles in 43 ms
-  after compile. The old `"custom"` periodogram is still not a drop-in (median Cl rel
-  ~0.25).
-* `gpu_tile_batch` (default 16) — spec for all tiles in one launch; MMF FFTs
-  every tile at once and scans only over `theta_500` (a 12 GB `(θ,T,ν)` buffer
-  OOM'd). Templates are cached across runner batches.
-* **CNC / catalogue path** (must match the NumPy catalogue): unique 6×6
-  spectra inverted with LAPACK then scattered on GPU
-  (`invert_spec_interp_tiles`; nearest-neighbour, same as per-mode inv).
-  Do **not** invert the 1024² grid with `jnp.linalg.inv` (moves `q_opt` at
-  ~3e-3 on singular modes) or use Jacobi inpaint. it1 is raster
-  Gauss-Seidel (threaded over tiles) + one stacked GPU FFT. Tiles 0–1:
-  **10/10**, median sep **0.0 arcmin**, max |Δq| **6e-6**. Warm 16 tiles
-  **8.0 s (0.50 s/tile)**.
+**GPU tile batch** (L1_m9, after JIT; 16-tile batches unless noted). Sequential
+was ~3.8 s/tile (NaMaster + per-mode LAPACK).
+
+| `gpu_tile_batch` | warm s/tile | notes |
+|---|---|---|
+| 8 | 0.71 | underfills the GPU |
+| **16** | **0.22–0.52** | fastest; homog quiet tiles ~0.22, L1_m9 ~0.50 |
+| 24 | 0.92 | slower (host↔device scatter of a larger inv stack) |
+| 32 | 0.50–0.66 | slower than 16 |
+| 40 | — | OOM allocating 26 GiB |
+
+Default `gpu_tile_batch` is **16**. `nmt_jax` matches NaMaster coupled cells
+(rfft visit, ~1e-16 on Cl > 1e-20). The `"custom"` periodogram is not a fsky
+drop-in (median Cl rel ~0.25).
+
+**25 search scales** (log-spaced 0.5′–32′, vs the 8-scale 1′–10′ grid). Only
+the MMF `scan` over θ and 3D peak-find scale with n_θ; spectra, unique-bin
+inv, and inpaint do not. Predicted **2–2.5×**. Measured on L1_m9, 16 tiles,
+warm: **3.6 s → 8.1 s (2.25×)**, 0.22 → 0.51 s/tile.
+
+Four L1 feedback prescriptions (L1_m9, fgas-8σ, M\*-1σ, LS8) were not
+finished in this session (batch-size retune aborted the full-sky jobs).
 
 ## 11. Suggested next steps
 
