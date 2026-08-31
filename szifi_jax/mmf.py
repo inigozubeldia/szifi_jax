@@ -526,8 +526,14 @@ class cluster_finder:
 
     def _gpu_tile_batch_ok(self):
         p = self.params_szifi
+        mmf_ok = p["mmf_type"] == "standard" or (
+            p["mmf_type"] == "spectrally_constrained"
+            and p.get("cmmf_type", "one_dep") == "one_dep"
+            and p["a_matrix"] is not None
+            and np.asarray(p["a_matrix"]).shape[1] >= 2
+        )
         return (
-            p["mmf_type"] == "standard"
+            mmf_ok
             and p["decouple_type"] == "fsky"
             and p["cov_type"] == "isotropic"
             and p["extraction_mode"] == "find"
@@ -651,6 +657,21 @@ class cluster_finder:
         cache = self._ensure_standard_templates(pix, filter_mask)
         tem_list = [cache[j][0] for j in range(len(self.theta_500_vec))]
         a_vec = jnp.asarray(self.params_szifi["a_matrix"][:, 0])
+        b_vec = None
+        sed_a_fft = sed_b_fft = None
+        if self.params_szifi["mmf_type"] == "spectrally_constrained":
+            b_vec = jnp.asarray(self.params_szifi["a_matrix"][:, 1])
+            dummy_inv = jnp.zeros((pix.nx, pix.ny, len(self.params_szifi["freqs"]),
+                                   len(self.params_szifi["freqs"])))
+            sed_a_fft, sed_b_fft = scmmf_one_dep_sed_ffts(
+                pix=pix,
+                freqs=self.params_szifi["freqs"],
+                inv_cov=dummy_inv,
+                lrange=self.params_szifi["lrange"],
+                beam_type=self.params_szifi["beam"],
+                exp=self.exp,
+                a_matrix=self.params_szifi["a_matrix"],
+            )
         bin_fac = self.params_szifi["powspec_bin_fac"]
         l0_bins = np.arange(pix.nx / bin_fac) * bin_fac * np.pi / (pix.nx * pix.dx)
         lf_bins = (np.arange(pix.nx / bin_fac) + 1) * bin_fac * np.pi / (pix.nx * pix.dx)
@@ -694,8 +715,15 @@ class cluster_finder:
             inv = spec.invert_spec_interp_tiles(
                 ell_map, ell_vec, spec_tensor,
                 backend=self.params_szifi.get("inv_cov_backend", "numpy"))
-            q_all, y_all, stds_all = get_mmf_q_maps_tiles(
-                t_obs, tem_list, inv, pix, a_vec)
+            if b_vec is None:
+                q_all, y_all, stds_all = get_mmf_q_maps_tiles(
+                    t_obs, tem_list, inv, pix, a_vec)
+            else:
+                a_dot_b, b_dot_b = scmmf_one_dep_dots_tiles(sed_a_fft, sed_b_fft, inv)
+                q_all, y_all, stds_all = get_mmf_q_maps_tiles(
+                    t_obs, tem_list, inv, pix, a_vec,
+                    b_vec=b_vec, a_dot_b=a_dot_b, b_dot_b=b_dot_b,
+                )
 
             next_active = []
             for k, tile in enumerate(active):
@@ -1815,7 +1843,8 @@ def get_mmf_q_maps_batch(tmap, tem_list, inv_cov, pix, a_vec):
         jnp.float64(pix.dx), jnp.float64(pix.dy), pnx, pny)
 
 
-def get_mmf_q_maps_tiles(tmaps, tem_list, inv_covs, pix, a_vec):
+def get_mmf_q_maps_tiles(tmaps, tem_list, inv_covs, pix, a_vec,
+                        b_vec=None, a_dot_b=None, b_dot_b=None):
     """Matched filter for a stack of tiles, templates shared.
 
     tmaps: (n_tile, nx, ny, n_freq)
@@ -1825,14 +1854,24 @@ def get_mmf_q_maps_tiles(tmaps, tem_list, inv_covs, pix, a_vec):
 
     FFTs and the 6×6 gemv run over all tiles at once. Theta is scanned so we
     never broadcast inv_cov over theta (that 5D einsum crashes on Blackwell).
+    If ``b_vec`` is set, apply one-dep sciMMF
+    ``C^{-1}(a⊙T) - (a·C^{-1}b)/(b·C^{-1}b) C^{-1}(b⊙T)``.
     """
     tem_batch = jnp.stack(tem_list, axis=0)
     nx, ny = pix.nx, pix.ny
     pnx = utils._next_fast_fft_len(2 * nx - 1)
     pny = utils._next_fast_fft_len(2 * ny - 1)
-    q, y, stds = _get_mmf_q_maps_tiles_jit(
-        jnp.asarray(tmaps), tem_batch, jnp.asarray(inv_covs), a_vec,
-        jnp.float64(pix.dx), jnp.float64(pix.dy), pnx, pny)
+    tmaps_j = jnp.asarray(tmaps)
+    inv_j = jnp.asarray(inv_covs)
+    dx = jnp.float64(pix.dx)
+    dy = jnp.float64(pix.dy)
+    if b_vec is None:
+        q, y, stds = _get_mmf_q_maps_tiles_jit(
+            tmaps_j, tem_batch, inv_j, a_vec, dx, dy, pnx, pny)
+    else:
+        q, y, stds = _get_scimmf_q_maps_tiles_jit(
+            tmaps_j, tem_batch, inv_j, a_vec, jnp.asarray(b_vec),
+            jnp.asarray(a_dot_b), jnp.asarray(b_dot_b), dx, dy, pnx, pny)
     return q, y, stds
 
 
@@ -1883,6 +1922,89 @@ def _get_mmf_q_maps_tiles_jit(tmaps, tem_batch, inv_covs, a_vec, dx, dy, pnx, pn
 
     q, y, stds = jax.lax.scan(step, None, (tem_fft_a, tem_a))[1]
     return jnp.swapaxes(q, 0, 1), jnp.swapaxes(y, 0, 1), jnp.swapaxes(stds, 0, 1)
+
+
+@functools.partial(jax.jit, static_argnums=(9, 10))
+def _get_scimmf_q_maps_tiles_jit(
+    tmaps, tem_batch, inv_covs, a_vec, b_vec, a_dot_b, b_dot_b, dx, dy, pnx, pny
+):
+    """Tile-parallel one-dep sciMMF. Same layout as ``_get_mmf_q_maps_tiles_jit``."""
+    n_tile, nx, ny_dim, n_freq = tmaps.shape
+    n_pix = nx * ny_dim
+    fft_norm = jnp.sqrt((dx * dy) / (nx * ny_dim))
+    ifft_norm = jnp.sqrt((nx * ny_dim) / (dx * dy))
+    dxdy = dx * dy
+    conv_dtype = tmaps.dtype
+    start0 = (nx - 1) // 2
+    start1 = (ny_dim - 1) // 2
+
+    fa_tmap = jnp.fft.fft2(jnp.moveaxis(tmaps, -1, 1), s=(pnx, pny))
+
+    tem_f = jnp.moveaxis(tem_batch, -1, 1)
+    tem_fft = jnp.fft.fft2(tem_f) * fft_norm
+    tem_fft_a = jnp.moveaxis(tem_fft * a_vec[None, :, None, None], 1, -1)
+    tem_fft_b = jnp.moveaxis(tem_fft * b_vec[None, :, None, None], 1, -1)
+    tem_a = tem_batch * a_vec[None, None, None, :]
+
+    inv_b = inv_covs.reshape((n_tile * n_pix, n_freq, n_freq))
+    lam = a_dot_b / b_dot_b
+    lam = jnp.where(jnp.isfinite(lam), lam, 0.)
+
+    def one_theta(tem_a_fft, tem_a_map, tem_b_fft):
+        a = jnp.broadcast_to(tem_a_fft, (n_tile, nx, ny_dim, n_freq)).reshape(
+            (n_tile * n_pix, n_freq))
+        b = jnp.broadcast_to(tem_b_fft, (n_tile, nx, ny_dim, n_freq)).reshape(
+            (n_tile * n_pix, n_freq))
+        filt_a = jnp.einsum("bi,bij->bj", a, inv_b).reshape(
+            (n_tile, nx, ny_dim, n_freq))
+        filt_b = jnp.einsum("bi,bij->bj", b, inv_b).reshape(
+            (n_tile, nx, ny_dim, n_freq))
+        filt = filt_a - lam[..., None] * filt_b
+        filt = jnp.where(jnp.isnan(filt), 0., filt)
+        filter_val = jnp.fft.ifft2(jnp.moveaxis(filt, -1, 1)).real * ifft_norm
+        filter_val = jnp.moveaxis(filter_val, 1, -1).astype(tmaps.dtype)
+        norm = jnp.sum(tem_a_map[None] * filter_val, axis=(1, 2, 3)) * dxdy
+        fb = jnp.fft.fft2(jnp.moveaxis(filter_val.astype(conv_dtype), -1, 1), s=(pnx, pny))
+        conv = jnp.fft.ifft2(jnp.sum(fa_tmap * fb, axis=1)).real
+        y = conv[:, start0:start0 + nx, start1:start1 + ny_dim].astype(jnp.float64) * dxdy
+        y = y / norm[:, None, None]
+        std = 1. / jnp.sqrt(norm)
+        q = y / std[:, None, None]
+        return q, y, std
+
+    def step(_, inputs):
+        return None, one_theta(*inputs)
+
+    q, y, stds = jax.lax.scan(step, None, (tem_fft_a, tem_a, tem_fft_b))[1]
+    return jnp.swapaxes(q, 0, 1), jnp.swapaxes(y, 0, 1), jnp.swapaxes(stds, 0, 1)
+
+
+def scmmf_one_dep_sed_ffts(pix, freqs, inv_cov, lrange, beam_type, exp, a_matrix, mask=None):
+    """Beam-convolved tSZ/CIB SED maps used in one-dep ``a_dot_b`` / ``b_dot_b``."""
+    if mask is None:
+        mask = jnp.ones((pix.nx, pix.ny, len(freqs)))
+    sed_a = a_matrix[:, 0][freqs]
+    sed_b = a_matrix[:, 1][freqs]
+    a_map_fft = jnp.ones((pix.nx, pix.nx, len(freqs)))
+    a_map_fft = maps.get_tmap_times_fvec(a_map_fft, sed_a)
+    a_map_fft = maps.get_map_convolved_fft(a_map_fft, pix, freqs, beam_type, mask, lrange, exp)
+    a_map_fft = maps.reshape_ell_matrix(a_map_fft, inv_cov.shape[:2])
+    b_map_fft = jnp.ones((pix.nx, pix.nx, len(freqs)))
+    b_map_fft = maps.get_tmap_times_fvec(b_map_fft, sed_b)
+    b_map_fft = maps.get_map_convolved_fft(b_map_fft, pix, freqs, beam_type, mask, lrange, exp)
+    b_map_fft = maps.reshape_ell_matrix(b_map_fft, inv_cov.shape[:2])
+    return a_map_fft, b_map_fft
+
+
+def scmmf_one_dep_dots_tiles(a_map_fft, b_map_fft, inv_covs):
+    """``a† C^{-1} b`` and ``b† C^{-1} b`` for a stack of tile inverse covariances."""
+    ac = jnp.conjugate(a_map_fft)
+    bc = jnp.conjugate(b_map_fft)
+    filt_a = jnp.einsum("xyi,txyij->txyj", ac, inv_covs)
+    a_dot_b = jnp.einsum("txyj,xyj->txy", filt_a, b_map_fft)
+    filt_b = jnp.einsum("xyi,txyij->txyj", bc, inv_covs)
+    b_dot_b = jnp.einsum("txyj,xyj->txy", filt_b, b_map_fft)
+    return a_dot_b, b_dot_b
 
 
 def get_tem_conv_fft(pix_tem,tem_fft,inv_cov,mmf_type="standard",cmmf_prec=None,comp=0):
@@ -2064,36 +2186,38 @@ def get_a_matrix_cib(params_szifi,params_model,data_file):
     cib.get_sed_first_moments_experiment(experiment=data_file["experiment"],
     bandpass=params_szifi["integrate_bandpass"],moment_parameters=params_szifi["deproject_cib"])
 
-    freqs = params_szifi["freqs"]
+    freq_idx = np.asarray(params_szifi["freqs"])
+    cib_sed = np.asarray(cib_sed)
+    tsz_sed = np.asarray(data_file["experiment"].tsz_sed)
 
-    a_matrix = np.zeros((len(freqs),len(params_szifi["deproject_cib"])))
+    a_matrix = np.zeros((len(freq_idx),len(params_szifi["deproject_cib"])))
 
     if params_szifi["deproject_cib"] == ["cib"]:
 
-        a_matrix = np.zeros((len(freqs),2))
-        a_matrix[:,0] = np.asarray(data_file["experiment"].tsz_sed[freqs])
-        a_matrix[:,1] = np.asarray(cib_sed[freqs])
+        a_matrix = np.zeros((len(freq_idx),2))
+        a_matrix[:,0] = tsz_sed[freq_idx]
+        a_matrix[:,1] = cib_sed[freq_idx]
 
     elif params_szifi["deproject_cib"] == ["cib","betaT"]:
 
-        a_matrix = np.zeros((len(freqs),3))
-        a_matrix[:,0] = np.asarray(data_file["experiment"].tsz_sed[freqs])
-        a_matrix[:,1] = np.asarray(cib_sed[freqs])
-        a_matrix[:,2] = np.asarray(cib.moments["betaT"][freqs])
+        a_matrix = np.zeros((len(freq_idx),3))
+        a_matrix[:,0] = tsz_sed[freq_idx]
+        a_matrix[:,1] = cib_sed[freq_idx]
+        a_matrix[:,2] = np.asarray(cib.moments["betaT"])[freq_idx]
 
     elif params_szifi["deproject_cib"] == ["cib","beta"]:
 
-        a_matrix = np.zeros((len(freqs),3))
-        a_matrix[:,0] = np.asarray(data_file["experiment"].tsz_sed[freqs])
-        a_matrix[:,1] = np.asarray(cib_sed[freqs])
-        a_matrix[:,2] = np.asarray(cib.moments["beta"][freqs])
+        a_matrix = np.zeros((len(freq_idx),3))
+        a_matrix[:,0] = tsz_sed[freq_idx]
+        a_matrix[:,1] = cib_sed[freq_idx]
+        a_matrix[:,2] = np.asarray(cib.moments["beta"])[freq_idx]
 
     elif params_szifi["deproject_cib"] == ["cib","betaT","beta"]:
 
-        a_matrix = np.zeros((len(freqs),3))
-        a_matrix[:,0] = np.asarray(data_file["experiment"].tsz_sed[freqs])
-        a_matrix[:,1] = np.asarray(cib_sed[freqs])
-        a_matrix[:,2] = np.asarray(cib.moments["betaT"][freqs])
-        a_matrix[:,3] = np.asarray(cib.moments["beta"][freqs])
+        a_matrix = np.zeros((len(freq_idx),4))
+        a_matrix[:,0] = tsz_sed[freq_idx]
+        a_matrix[:,1] = cib_sed[freq_idx]
+        a_matrix[:,2] = np.asarray(cib.moments["betaT"])[freq_idx]
+        a_matrix[:,3] = np.asarray(cib.moments["beta"])[freq_idx]
 
     params_szifi["a_matrix"] = a_matrix

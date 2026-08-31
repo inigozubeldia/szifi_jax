@@ -344,9 +344,8 @@ Not yet exercised by any test:
 
 * CAR / Simons Observatory tiles, and multi-field runs. The template-cache fix (§7) is
   unit-tested but has not been run end-to-end on CAR data. **This is the biggest gap.**
-* `mmf_type="spectrally_constrained"` (both `cmmf_type="one_dep"` and `"general"`). Note that
-  `utils.invert_cov`, which that path uses, inverts on the GPU regardless of
-  `inv_cov_backend`.
+* `mmf_type="spectrally_constrained"` with `cmmf_type="general"` (CIB moments).
+  `one_dep` (single CIB SED) is on the GPU tile-batch path and matches NumPy.
 * The iterative noise path with `max_it > 1`.
 * `powspec_lmax1d` / `powspec_new_shape`, including the sequential fallback they now trigger.
 * `cov_type` other than `"isotropic"`.
@@ -407,10 +406,17 @@ Jax catalogues vs NumPy `fullsky_splitA_immf_q5.npz`; every position matched
 | M\*−1σ | **2634/2634** | 4.9e-3 (one cluster) | 9.9 min |
 | LS8 | **1561/1561** | 2.8e-5 | 9.0 min |
 
+**sciMMF one-dep** (CIB deprojection). GPU tile-batch uses the same FFT/gemv
+layout as iMMF plus `C^{-1}(a⊙T) − λ C^{-1}(b⊙T)` with
+`λ = (a·C^{-1}b)/(b·C^{-1}b)` from beam-convolved SED maps. `tests/test_scimmf_gpu.py`
+matches sequential `get_mmf_q_map` on toy tiles. On L1_m9 tiles 0–1 vs NumPy
+szifi: **N=12/12**, median sep **0**, max \|Δq\| **1.5e-5**, θ exact.
+(`cmmf_type="general"` is still sequential.)
+
 ## 11. Suggested next steps
 
 1. Extend `tests/test_comparison.py` to CAR tiles and a multi-field run.
-2. Exercise the spectrally-constrained MMF and `max_it > 1`; give `utils.invert_cov` the same
+2. Exercise `cmmf_type="general"` and `max_it > 1`; give `utils.invert_cov` the same
    backend switch as `spec.get_inv_cov`.
 3. Decide whether `coupling_matrix_backend="jax"` should become the default. It is 43x faster
    end to end and costs 2.4e-7 in `q_opt`, but it is not bit-compatible with NaMaster, and the
