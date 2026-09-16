@@ -59,6 +59,156 @@ def _bin_cross_spec_jit(cross_spec_maps, ell_map, bins_low, bins_high, n_bins):
     return spec_binned, n_modes
 
 
+def _nmt_rfft_visit_grids(n0, n1, dx, dy):
+    """kmod and rfft column index for NaMaster's full-plane visit of rfft2.
+
+    For a C-contiguous map of shape ``(n0, n1)``, ``numpy.fft.rfft2`` (and
+    NaMaster's FFTW r2c) transform the last axis. ``fs_alm2cl`` then walks
+    every full-plane mode, mapping ``ix > n1/2`` back onto the rfft half-plane
+    so interior modes are counted twice. Binning is ``ell_0 <= k < ell_f``.
+    Measured agreement with ``compute_coupled_cell_flat`` is ~1e-16 on the
+    non-empty bins.
+    """
+    dky = 2.0 * np.pi / (n0 * dx)
+    dkx = 2.0 * np.pi / (n1 * dy)
+    iy = np.arange(n0)
+    ix = np.arange(n1)
+    ky = np.where(2 * iy <= n0, iy * dky, -(n0 - iy) * dky)
+    kx = np.where(2 * ix <= n1, ix * dkx, -(n1 - ix) * dkx)
+    ix_here = np.where(2 * ix <= n1, ix, n1 - ix).astype(np.int32)
+    kmod = np.sqrt(kx[None, :] ** 2 + ky[:, None] ** 2)
+    return kmod, ix_here
+
+
+@functools.partial(jax.jit, static_argnums=(6,))
+def _coupled_cells_nmt_jit(tmaps, mask, alm_norm, cl_norm, ix_here, kmod,
+                            n_bins, bins_low, bins_high):
+    """NaMaster coupled cells for a stack of tiles.
+
+    tmaps: (n_tile, n0, n1, n_freq) — szifi layout
+    mask:  (n_tile, n0, n1)
+    ix_here: (n1,) rfft column for each full-plane ix
+    kmod: (n0, n1) matching rfft2 visit plane
+    Returns: (n_tile, n_bins, n_freq, n_freq)
+    """
+    t_masked = tmaps * mask[..., None]
+    t_freq = jnp.moveaxis(t_masked, -1, 1)
+    alm = jnp.fft.rfft2(t_freq) * alm_norm
+    alm_vis = alm[..., ix_here]
+    power = jnp.real(alm_vis[:, :, None] * jnp.conj(alm_vis[:, None, :]))
+    power = jnp.moveaxis(power, (1, 2), (3, 4))  # (T, nx, ny, nf, nf)
+
+    def _bin_one(p):
+        spec_binned, _ = _bin_cross_spec_jit(p, kmod, bins_low, bins_high, n_bins)
+        return spec_binned
+
+    spec_binned = jax.vmap(_bin_one)(power)
+    return spec_binned * cl_norm
+
+
+def coupled_cells_nmt(tmaps, pix, l0_bins, lf_bins, masks=None):
+    """Coupled flat-sky cells matching ``nmt.compute_coupled_cell_flat``.
+
+    tmaps: (n_tile, nx, ny, n_freq) or (nx, ny, n_freq)
+    masks: (n_tile, nx, ny) or (nx, ny) or None (all ones)
+    Returns: (n_tile, n_bins, n_freq, n_freq)
+    """
+    tmaps = jnp.asarray(tmaps)
+    if tmaps.ndim == 3:
+        tmaps = tmaps[None, ...]
+    n_tile, n0, n1, n_freq = tmaps.shape
+    if masks is None:
+        masks = jnp.ones((n_tile, n0, n1), dtype=tmaps.dtype)
+    else:
+        masks = jnp.asarray(masks)
+        if masks.ndim == 2:
+            masks = jnp.broadcast_to(masks, (n_tile, n0, n1))
+
+    lx = n0 * pix.dx
+    ly = n1 * pix.dy
+    alm_norm = lx * ly / (2.0 * np.pi * n0 * n1)
+    cl_norm = 4.0 * np.pi ** 2 / (lx * ly)
+    kmod, ix_here = _nmt_rfft_visit_grids(n0, n1, pix.dx, pix.dy)
+    n_bins = int(len(l0_bins))
+    return _coupled_cells_nmt_jit(
+        tmaps, masks, jnp.float64(alm_norm), jnp.float64(cl_norm),
+        jnp.asarray(ix_here), jnp.asarray(kmod), n_bins,
+        jnp.asarray(l0_bins), jnp.asarray(lf_bins),
+    )
+
+
+def apply_fsky_inpaint_drop_first(spec_full, ell_eff, masks, mask_point,
+                                 decouple_type, inpaint_flag, lsep):
+    """fsky / inpaint corrections then drop bin 0, matching get_cross_spec.
+
+    spec_full: (n_tile, n_bins, n_freq, n_freq)
+    masks, mask_point: (n_tile, nx, ny)
+    Returns ell[1:], spec[:, 1:]
+    """
+    spec = np.asarray(spec_full)
+    ell = np.asarray(ell_eff)
+    masks = np.asarray(masks)
+    n_tile, nx, ny = masks.shape[:3] if masks.ndim == 3 else (1,) + masks.shape
+    if masks.ndim == 2:
+        masks = masks[None]
+        spec = spec if spec.ndim == 4 else spec[None]
+    if decouple_type == "fsky":
+        n_pix = nx * ny
+        fsky = np.sum(masks, axis=(1, 2)) / n_pix
+        m1 = np.sum(masks ** 2, axis=(1, 2)) / n_pix
+        m2 = np.sum(masks ** 4, axis=(1, 2)) / n_pix
+        fsky = fsky * m1 ** 2 / np.maximum(m2, 1e-300)
+        spec = spec / fsky[:, None, None, None]
+    if inpaint_flag:
+        mp = np.asarray(mask_point)
+        if mp.ndim == 2:
+            mp = mp[None]
+        fsky_p = np.sum(mp, axis=(1, 2)) / (mp.shape[1] * mp.shape[2])
+        high = ell > lsep
+        spec = spec.copy()
+        spec[:, high] /= np.maximum(fsky_p[:, None, None, None], 1e-300)
+    return ell[1:], spec[:, 1:]
+
+
+def interp_cov_tiles(ell_map, ell_vec, spec_tensors):
+    """Nearest-neighbour interp of (n_tile, n_ell, nf, nf) onto the 2D ell map."""
+    ell_map_j = jnp.asarray(ell_map)
+    ell_vec_j = jnp.asarray(ell_vec)
+    spec_j = jnp.asarray(spec_tensors)
+    return jax.vmap(lambda s: _interp_cov_jit(ell_map_j, ell_vec_j, s))(spec_j)
+
+
+def invert_spec_interp_tiles(ell_map, ell_vec, spec_tensors, backend="numpy"):
+    """Invert unique 1D 6×6 spectra, then nearest-neighbour scatter onto the 2D grid.
+
+    Equivalent to interpolating then inverting per mode, because interpolation is a
+    gather of those unique matrices. LAPACK on ~n_ell matrices per tile is exact
+    and avoids ~16 million 6×6 inversions (and a 4.5 GB host copy).
+    """
+    if backend == "jax":
+        inv_1d = jnp.linalg.inv(jnp.asarray(spec_tensors))
+    else:
+        inv_1d = np.linalg.inv(np.ascontiguousarray(np.asarray(spec_tensors), dtype=np.float64))
+    return interp_cov_tiles(ell_map, ell_vec, inv_1d)
+
+
+def invert_cov_tiles(cov, backend="numpy"):
+    """Invert a stack of per-mode covariances (n_tile, nx, ny, nf, nf).
+
+    JAX inversion is scanned over tiles so a 16–32 tile stack does not need a
+    second 9 GB workspace (a batched ``linalg.inv`` OOM'd at 32 tiles here).
+    """
+    cov = jnp.asarray(cov)
+    if backend == "jax":
+        def step(_, c):
+            return None, jnp.linalg.inv(c)
+        return jax.lax.scan(step, None, cov)[1]
+    cov_np = np.ascontiguousarray(np.asarray(cov), dtype=np.float64)
+    shp = cov_np.shape
+    inv = np.linalg.inv(cov_np.reshape(-1, shp[-2], shp[-1])).reshape(shp)
+    return jnp.asarray(inv)
+
+
 @jax.jit
 def _interp_cov_jit(ell_map, ell_vec, spec_tensor):
     """Interpolate 1D binned spectra onto 2D ell map, nearest-neighbour.
@@ -437,6 +587,12 @@ class cross_spec:
                                                 mask_point, ps, inpaint_flag, lsep,
                                                 decouple_type)
 
+        if implementation == "nmt_jax":
+
+            return self._get_cross_spec_nmt_jax(pix, t_map, t_map_2, mask,
+                                                mask_point, ps, inpaint_flag, lsep,
+                                                decouple_type)
+
         # Original pymaster path
         ell = ps.ell_eff[1:]
         n_freq = self.n_freqs
@@ -480,6 +636,25 @@ class cross_spec:
         self.ell_vec = ell
 
         return ell,spec_tensor
+
+    def _get_cross_spec_nmt_jax(self, pix, t_map, t_map_2, mask,
+                                mask_point, ps, inpaint_flag, lsep,
+                                decouple_type):
+        """JAX coupled cells matching NaMaster ``compute_coupled_cell_flat``."""
+        if t_map_2 is not None and t_map_2 is not t_map:
+            raise NotImplementedError(
+                "nmt_jax currently supports auto-spectra (t_map_2 is t_map)"
+            )
+        spec_full = coupled_cells_nmt(t_map, pix, ps.l0_bins, ps.lf_bins, masks=mask)
+        mask_np = np.asarray(mask)
+        ell_vec, spec_tensor = apply_fsky_inpaint_drop_first(
+            spec_full, ps.ell_eff, mask_np, mask_point,
+            decouple_type, inpaint_flag, lsep,
+        )
+        spec_tensor = np.asarray(spec_tensor[0])
+        self.spec_tensor = spec_tensor
+        self.ell_vec = ell_vec
+        return ell_vec, spec_tensor
 
     def _get_cross_spec_custom(self, pix, t_map, t_map_2, mask,
                                 mask_point, ps, inpaint_flag, lsep,

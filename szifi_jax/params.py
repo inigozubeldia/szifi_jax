@@ -17,9 +17,10 @@ params_szifi_default = {
 "powspec_lmax1d": None, # maximum lmax for power spectra. Maps and masks will be degraded to this lmax before computing coupling matrix and power spectra
 "powspec_new_shape": None, # New shape for calculating powspec on lower resolution map. One of this and powspec_lmax1d must be 'None'
 "powspec_bin_fac": 4, # Factor by which to bin Cls. There will be nx/bin_fac bins of width bin_fac * (pi/(nx*dx)) for a field of nx^2 pixels
-"powspec_implementation": "pymaster", # "pymaster" (NaMaster, matches szifi) or "custom" (JAX, no pymaster)
+"powspec_implementation": "pymaster", # "pymaster" (NaMaster, matches szifi), "nmt_jax" (GPU, matches NaMaster coupled cells), or "custom" (JAX periodogram, NOT a drop-in for fsky)
 "mmf_batched": True, # if False, filter each theta_500 sequentially (direct transcription of
                      # szifi's loop) instead of batching them into one GPU call
+"gpu_tile_batch": 1, # >1: process this many tiles per GPU spec/inv/MMF launch (fsky + standard MMF)
 "coupling_matrix_backend": "pymaster", # "pymaster" or "jax" (GPU, ~385x faster, but NOT
                                       # bit-compatible with NaMaster -- see spec.get_coupling_matrix_jax)
 "inv_cov_backend": "numpy", # "numpy" (LAPACK, matches szifi) or "jax" (cuSOLVER, stays on device).

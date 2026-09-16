@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import functools
 from numba import njit as numba_njit
 from scipy import interpolate
 import scipy.signal as sp
@@ -299,6 +300,24 @@ def filter_tmap(tmap_val,pix,ell_filter,indices_filter=None,filter_mask=None):
     dtype = tmap_val.dtype
     result = get_ifft_f(filter_fft_f(get_fft_f(tmap_val,pix),pix,ell_filter,indices_filter=indices_filter,filter_mask=filter_mask),pix).real
     return jnp.asarray(result, dtype=dtype)
+
+
+@jax.jit
+def _filter_tmaps_jit(tmaps, filter_mask, fft_norm, ifft_norm):
+    """tmaps: (n_tile, nx, ny, n_freq), filter_mask: (nx, ny)."""
+    t_freq = jnp.moveaxis(tmaps, -1, 1)
+    fft = jnp.fft.fft2(t_freq) * fft_norm
+    fft = fft * filter_mask[None, None, :, :]
+    out = jnp.fft.ifft2(fft).real * ifft_norm
+    return jnp.moveaxis(out, 1, -1).astype(tmaps.dtype)
+
+
+def filter_tmaps(tmaps, pix, filter_mask):
+    fft_norm = jnp.sqrt((pix.dx * pix.dy) / (pix.nx * pix.ny))
+    ifft_norm = jnp.sqrt((pix.nx * pix.ny) / (pix.dx * pix.dy))
+    return _filter_tmaps_jit(jnp.asarray(tmaps), jnp.asarray(filter_mask),
+                              fft_norm, ifft_norm)
+
 
 def filter_map(map_val,pix,ell_filter):
 
@@ -1138,6 +1157,11 @@ def get_map_convolved_fft(map_fft_original,pix,freqs,beam_type,mask,lrange,exp):
 
     return a_map_fft
 
+def mask_has_holes(mask):
+    """True if any pixel is a hole (mask <= 0.5). All-ones masks are a no-op for inpaint."""
+    return bool(np.any(np.asarray(mask) <= 0.5))
+
+
 def inpaint_freq(tmap_val,mask,n_inpaint=None, pix=None, noise=None,inpaint_type="diffusive"):
 
     if inpaint_type == "diffusive_jax":
@@ -1163,6 +1187,49 @@ def _inpaint_freq_vmap(tmap_3d, mask, n_inpaint):
     """Vectorized diffusive inpainting over all frequency channels at once."""
     return jax.vmap(lambda img: diffusive_inpaint_jax(img, mask, n_inpaint),
                     in_axes=2, out_axes=2)(tmap_3d)
+
+
+@functools.partial(jax.jit, static_argnums=(2,))
+def _inpaint_freq_tiles_jit(tmaps, masks, n_inpaint):
+    """Jacobi inpaint over tiles and frequencies. tmaps (T, nx, ny, nf)."""
+    def one_tile(tmap, mask):
+        return jax.vmap(lambda img: diffusive_inpaint_jax(img, mask, n_inpaint),
+                        in_axes=2, out_axes=2)(tmap)
+    return jax.vmap(one_tile)(tmaps, masks)
+
+
+def inpaint_freq_tiles(tmaps, masks, n_inpaint=100):
+    """GPU Jacobi inpaint for a stack of tiles (it1 cluster holes)."""
+    return _inpaint_freq_tiles_jit(jnp.asarray(tmaps), jnp.asarray(masks), int(n_inpaint))
+
+
+def inpaint_freq_tiles_gs(tmaps, masks, n_inpaint=100):
+    """Exact Gauss-Seidel inpaint, one tile per thread (tiles are independent).
+
+    Same algorithm as ``inpaint_type="diffusive"``. Numba GS releases the GIL, so
+    a thread pool over tiles is faster than a Python loop and does not change
+    the pixels. Do not use ``inpaint_freq_tiles`` (Jacobi) when the catalogue
+    must match szifi / CNC.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    import os
+
+    t_list = [np.asarray(t) for t in tmaps]
+    m_list = [np.asarray(m) for m in masks]
+    n = len(t_list)
+    n_inpaint = int(n_inpaint)
+
+    def _one(i):
+        if not mask_has_holes(m_list[i]):
+            return t_list[i]
+        return np.asarray(inpaint_freq(
+            t_list[i], m_list[i], n_inpaint=n_inpaint, inpaint_type="diffusive"))
+
+    workers = min(n, max(1, os.cpu_count() or 8))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        parts = list(ex.map(_one, range(n)))
+    return jnp.stack(parts)
+
 
 def inpaint(image, mask, n_inpaint=None, pix=None, noise=None, inpaint_type="diffusive"):
 
@@ -1381,7 +1448,7 @@ def circular_cosine_blend_adaptive_multi(
     return blended
 
 
-@numba_njit(cache=True)
+@numba_njit(cache=True, nogil=True)
 def _diffusive_inpaint_gs(masked_image, x_0, y_0, n_inpaint):
     """Raster-order Gauss-Seidel sweeps, writing in place. szifi's algorithm, exactly.
 
